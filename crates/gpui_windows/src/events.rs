@@ -789,12 +789,17 @@ impl WindowsWindowInner {
 
         unsafe {
             let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
-            let saved_top = (*params).rgrc[0].top;
+            let proposed = (*params).rgrc[0];
             let result = DefWindowProcW(handle, WM_NCCALCSIZE, wparam, lparam);
-            (*params).rgrc[0].top = saved_top;
             if self.state.is_maximized() {
+                // Keep the existing maximized geometry, including its top frame adjustment.
+                (*params).rgrc[0].top = proposed.top;
                 let dpi = GetDpiForWindow(handle);
                 (*params).rgrc[0].top += get_frame_thicknessx(dpi);
+            } else {
+                // In normal Windowed mode the transparent titlebar owns the full proposed
+                // rectangle. WS_THICKFRAME remains in place for native resize and DWM shadow.
+                (*params).rgrc[0] = proposed;
             }
             Some(result.0 as isize)
         }
@@ -886,7 +891,10 @@ impl WindowsWindowInner {
         let is_maximized = self.state.is_maximized();
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
-        self.state.border_offset.update(handle).log_err();
+        self.state
+            .border_offset
+            .update(handle, self.hide_title_bar)
+            .log_err();
 
         self.state
             .direct_manipulation
@@ -965,67 +973,81 @@ impl WindowsWindowInner {
             return None;
         }
 
-        let callback = self.state.callbacks.hit_test_window_control.take();
-        let drag_area = if let Some(mut callback) = callback {
-            let area = callback();
-            self.state
-                .callbacks
-                .hit_test_window_control
-                .set(Some(callback));
-            area.and_then(|area| match area {
-                WindowControlArea::Drag if self.is_movable => Some(HTCAPTION as _),
-                WindowControlArea::Drag => None,
-                WindowControlArea::Close => Some(HTCLOSE as _),
-                WindowControlArea::Max if self.is_resizable => Some(HTMAXBUTTON as _),
-                WindowControlArea::Max if self.is_movable => Some(HTCAPTION as _),
-                WindowControlArea::Max => Some(HTNOWHERE as _),
-                WindowControlArea::Min if self.is_minimizable => Some(HTMINBUTTON as _),
-                WindowControlArea::Min if self.is_movable => Some(HTCAPTION as _),
-                WindowControlArea::Min => Some(HTNOWHERE as _),
-            })
-        } else {
-            None
+        let hit_test_window_control = || {
+            let callback = self.state.callbacks.hit_test_window_control.take();
+            if let Some(mut callback) = callback {
+                let area = callback();
+                self.state
+                    .callbacks
+                    .hit_test_window_control
+                    .set(Some(callback));
+                area.and_then(|area| match area {
+                    WindowControlArea::Drag if self.is_movable => Some(HTCAPTION as _),
+                    WindowControlArea::Drag => None,
+                    WindowControlArea::Close => Some(HTCLOSE as _),
+                    WindowControlArea::Max if self.is_resizable => Some(HTMAXBUTTON as _),
+                    WindowControlArea::Max if self.is_movable => Some(HTCAPTION as _),
+                    WindowControlArea::Max => Some(HTNOWHERE as _),
+                    WindowControlArea::Min if self.is_minimizable => Some(HTMINBUTTON as _),
+                    WindowControlArea::Min if self.is_movable => Some(HTCAPTION as _),
+                    WindowControlArea::Min => Some(HTNOWHERE as _),
+                })
+            } else {
+                None
+            }
         };
 
         if !self.hide_title_bar {
             // If the OS draws the title bar, we don't need to handle hit test messages.
-            return drag_area;
+            return hit_test_window_control();
         }
 
-        let dpi = unsafe { GetDpiForWindow(handle) };
-        // We do not use the OS title bar, so the default `DefWindowProcW` will only register a 1px edge for resizes
-        // We need to calculate the frame thickness ourselves and do the hit test manually.
-        let frame_y = get_frame_thicknessx(dpi);
-        let frame_x = get_frame_thicknessy(dpi);
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
+        // We do not use the OS title bar, so the default `DefWindowProcW` cannot supply
+        // useful resize hit tests after WM_NCCALCSIZE exposes the full client rectangle.
+        if self.is_resizable && !self.state.is_maximized() {
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(handle, &mut rect) }.is_ok() {
+                let left = rect.left as i64;
+                let top = rect.top as i64;
+                let right = rect.right as i64;
+                let bottom = rect.bottom as i64;
+                let width = right - left;
+                let height = bottom - top;
 
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        if self.is_resizable
-            && !self.state.is_maximized()
-            && 0 <= cursor_point.y
-            && cursor_point.y <= frame_y
-        {
-            // x-axis actually goes from -frame_x to 0
-            return Some(if cursor_point.x <= 0 {
-                HTTOPLEFT
-            } else {
-                let mut rect = Default::default();
-                unsafe { GetWindowRect(handle, &mut rect) }.log_err();
-                // right and bottom bounds of RECT are exclusive, thus `-1`
-                let right = rect.right - rect.left - 1;
-                // the bounds include the padding frames, so accommodate for both of them
-                if right - 2 * frame_x <= cursor_point.x {
-                    HTTOPRIGHT
-                } else {
-                    HTTOP
+                if width > 0 && height > 0 {
+                    let dpi = unsafe { GetDpiForWindow(handle) };
+                    let frame_x = (get_frame_thicknessx(dpi).max(0) as i64).min(width / 2);
+                    let frame_y = (get_frame_thicknessy(dpi).max(0) as i64).min(height / 2);
+                    let cursor_x = lparam.signed_loword() as i64 - left;
+                    let cursor_y = lparam.signed_hiword() as i64 - top;
+                    let inside =
+                        0 <= cursor_x && cursor_x < width && 0 <= cursor_y && cursor_y < height;
+
+                    if inside {
+                        let left_edge = cursor_x < frame_x;
+                        let right_edge = cursor_x >= width - frame_x;
+                        let top_edge = cursor_y < frame_y;
+                        let bottom_edge = cursor_y >= height - frame_y;
+                        let resize_hit = match (left_edge, right_edge, top_edge, bottom_edge) {
+                            (true, false, true, false) => Some(HTTOPLEFT),
+                            (false, true, true, false) => Some(HTTOPRIGHT),
+                            (true, false, false, true) => Some(HTBOTTOMLEFT),
+                            (false, true, false, true) => Some(HTBOTTOMRIGHT),
+                            (true, false, false, false) => Some(HTLEFT),
+                            (false, true, false, false) => Some(HTRIGHT),
+                            (false, false, true, false) => Some(HTTOP),
+                            (false, false, false, true) => Some(HTBOTTOM),
+                            _ => None,
+                        };
+                        if let Some(resize_hit) = resize_hit {
+                            return Some(resize_hit as _);
+                        }
+                    }
                 }
-            } as _);
+            }
         }
 
-        drag_area
+        hit_test_window_control()
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
@@ -1215,7 +1237,10 @@ impl WindowsWindowInner {
     ) -> Option<isize> {
         if wparam.0 != 0 {
             self.state.click_state.system_update(wparam.0);
-            self.state.border_offset.update(handle).log_err();
+            self.state
+                .border_offset
+                .update(handle, self.hide_title_bar)
+                .log_err();
             // system settings may emit a window message which wants to take the refcell self.state, so drop it
 
             self.system_settings().update(wparam.0);

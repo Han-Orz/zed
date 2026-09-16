@@ -567,7 +567,7 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
-        this.state.border_offset.update(hwnd)?;
+        this.state.border_offset.update(hwnd, this.hide_title_bar)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
         if params.show {
@@ -1367,7 +1367,13 @@ pub(crate) struct WindowBorderOffset {
 }
 
 impl WindowBorderOffset {
-    pub(crate) fn update(&self, hwnd: HWND) -> anyhow::Result<()> {
+    pub(crate) fn update(&self, hwnd: HWND, full_client_frame: bool) -> anyhow::Result<()> {
+        if full_client_frame {
+            self.width_offset.set(0);
+            self.height_offset.set(0);
+            return Ok(());
+        }
+
         let window_rect = unsafe {
             let mut rect = std::mem::zeroed();
             GetWindowRect(hwnd, &mut rect)?;
