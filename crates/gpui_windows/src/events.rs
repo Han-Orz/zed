@@ -104,6 +104,7 @@ impl WindowsWindowInner {
             WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_NCCALCSIZE => self.handle_calc_client_size(handle, wparam, lparam),
             WM_DPICHANGED => self.handle_dpi_changed_msg(handle, wparam, lparam),
+            WM_DWMCOMPOSITIONCHANGED => self.handle_dwm_composition_changed_msg(handle),
             WM_DISPLAYCHANGE => self.handle_display_change_msg(handle),
             WM_NCHITTEST => self.handle_hit_test_msg(handle, lparam),
             WM_PAINT => self.handle_paint_msg(handle),
@@ -873,6 +874,17 @@ impl WindowsWindowInner {
 
     fn handle_create_msg(&self, handle: HWND) -> Option<isize> {
         if self.hide_title_bar {
+            extend_dwm_frame_for_full_client(handle);
+            notify_frame_changed(handle);
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn handle_dwm_composition_changed_msg(&self, handle: HWND) -> Option<isize> {
+        if self.hide_title_bar {
+            extend_dwm_frame_for_full_client(handle);
             notify_frame_changed(handle);
             Some(0)
         } else {

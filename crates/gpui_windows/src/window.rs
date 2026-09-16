@@ -1366,6 +1366,18 @@ pub(crate) struct WindowBorderOffset {
     pub(crate) height_offset: Cell<i32>,
 }
 
+pub(crate) fn extend_dwm_frame_for_full_client(hwnd: HWND) {
+    // Keep the smallest positive DWM frame extent needed for the external shadow.
+    // WM_NCCALCSIZE still exposes the entire window as client content.
+    let margins = MARGINS {
+        cxLeftWidth: 0,
+        cxRightWidth: 0,
+        cyTopHeight: 0,
+        cyBottomHeight: 1,
+    };
+    unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins).log_err() };
+}
+
 impl WindowBorderOffset {
     pub(crate) fn update(&self, hwnd: HWND, full_client_frame: bool) -> anyhow::Result<()> {
         if full_client_frame {
