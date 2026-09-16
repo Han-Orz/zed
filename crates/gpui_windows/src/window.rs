@@ -1367,13 +1367,13 @@ pub(crate) struct WindowBorderOffset {
 }
 
 pub(crate) fn extend_dwm_frame_for_full_client(hwnd: HWND) {
-    // Keep DWM frame rendering active without extending a visible frame into the client.
+    // Keep the smallest DWM frame extent that preserves the external shadow.
     // WM_NCCALCSIZE still exposes the entire window as client content.
     let margins = MARGINS {
         cxLeftWidth: 0,
         cxRightWidth: 0,
         cyTopHeight: 0,
-        cyBottomHeight: 0,
+        cyBottomHeight: 1,
     };
     unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins).log_err() };
 }
