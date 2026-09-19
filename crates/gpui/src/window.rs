@@ -2793,6 +2793,22 @@ impl Window {
         self.platform_window.present_count()
     }
 
+    /// How many compositor overlays this window's renderer has created.
+    /// Diagnostics evidence only: a higher number than the app's last seen
+    /// one means its overlay handle was replaced and it must re-assert its
+    /// full state.
+    #[cfg(feature = "diagnostics")]
+    pub fn compositor_overlay_generation(&self) -> u64 {
+        self.platform_window.compositor_overlay_generation()
+    }
+
+    /// How many device-lost compositor overlay rebuilds failed. Diagnostics
+    /// evidence only.
+    #[cfg(feature = "diagnostics")]
+    pub fn compositor_overlay_rebuild_failures(&self) -> u64 {
+        self.platform_window.compositor_overlay_rebuild_failures()
+    }
+
     /// The window's compositor overlay visual, when the platform supports
     /// one. The overlay is presentation-only platform content the compositor
     /// can position and animate without the app rendering a frame; it never

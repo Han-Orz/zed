@@ -1024,6 +1024,16 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().present_count()
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn compositor_overlay_generation(&self) -> u64 {
+        self.state.renderer.borrow().overlay_generation()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn compositor_overlay_rebuild_failures(&self) -> u64 {
+        self.state.renderer.borrow().overlay_rebuild_failures()
+    }
+
     fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
         self.state.renderer.borrow_mut().compositor_overlay()
     }

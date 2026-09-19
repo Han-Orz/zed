@@ -29,6 +29,24 @@ use windows::{
     },
 };
 
+/// Drop the cached overlay when it reported a failure, so the caller's next
+/// step builds a fresh one. Returns whether one was dropped. This is the one
+/// place the dead-handle decision lives: an overlay that failed keeps a
+/// visual the compositor no longer shows, and serving it again would keep
+/// re-asserting state onto nothing.
+pub(crate) fn drop_unhealthy_overlay<T: PlatformCompositorOverlay + ?Sized>(
+    overlay: &mut Option<Rc<RefCell<T>>>,
+) -> bool {
+    let unhealthy = overlay
+        .as_ref()
+        .is_some_and(|overlay| !overlay.borrow().is_healthy());
+    if unhealthy {
+        *overlay = None;
+    }
+    unhealthy
+}
+
+
 use crate::directx_renderer::{DirectComposition, DirectXRendererDevices};
 
 pub(crate) struct CompositorOverlay {
@@ -50,6 +68,12 @@ pub(crate) struct CompositorOverlay {
     /// remembered opacity: a rebuild restores the value this motion holds or
     /// is passing through, so the overlay never comes back at a stale one.
     motion: Motion,
+    /// Cleared when a compositor operation fails. The remembered state
+    /// (geometry, color, motion) can then no longer be trusted to describe
+    /// what the compositor shows, so the renderer drops the handle on its
+    /// next request and builds a fresh overlay instead of reporting success
+    /// on a visual that is not there.
+    healthy: bool,
 }
 
 /// What the compositor is playing on the overlay's opacity. DirectComposition
@@ -159,13 +183,32 @@ impl CompositorOverlay {
             color: [0.0, 0.0, 0.0, 1.0],
             // Created invisible: the app's first fade brings it in.
             motion: Motion::Hold(0.0),
+            healthy: true,
         })))
     }
 
     /// Recreate the overlay's composition resources on a fresh DirectComposition
     /// device after device loss, preserving the app's geometry, color and
     /// opacity state. The `Rc` the app holds stays valid.
+    ///
+    /// A failure here leaves the overlay dead — its visual belongs to a
+    /// destroyed device — so the overlay marks itself unhealthy. The renderer
+    /// then drops the handle on its next request and the following one builds
+    /// a fresh overlay, which is the recovery path: an app that keeps its
+    /// handle is told to refresh it and re-asserts its full state.
     pub(crate) fn rebuild(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        composition: &DirectComposition,
+    ) -> Result<()> {
+        if let Err(error) = self.rebuild_impl(devices, composition) {
+            self.healthy = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn rebuild_impl(
         &mut self,
         devices: &DirectXRendererDevices,
         composition: &DirectComposition,
@@ -375,30 +418,87 @@ impl PlatformCompositorOverlay for CompositorOverlay {
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32) {
         if let Err(error) = self.set_geometry_impl(x, y, width, height) {
             log::error!("compositor overlay set_geometry failed: {error}");
+            self.healthy = false;
         }
     }
 
     fn set_color(&mut self, color: [f32; 4]) {
         if let Err(error) = self.set_color_impl(color) {
             log::error!("compositor overlay set_color failed: {error}");
+            self.healthy = false;
         }
     }
 
     fn fade_opacity(&mut self, target: f32, duration_s: f64) {
         if let Err(error) = self.fade_impl(target, duration_s) {
             log::error!("compositor overlay fade_opacity failed: {error}");
+            self.healthy = false;
         }
     }
 
     fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]) {
         if let Err(error) = self.breathe_impl(segments) {
             log::error!("compositor overlay animate_opacity_cycle failed: {error}");
+            self.healthy = false;
         }
     }
 
     fn hold_opacity(&mut self, opacity: f32) {
         if let Err(error) = self.hold_impl(opacity) {
             log::error!("compositor overlay hold_opacity failed: {error}");
+            self.healthy = false;
         }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for the platform overlay: no device, just the health flag
+    /// the drop decision reads.
+    struct FakeOverlay {
+        healthy: bool,
+    }
+
+    impl PlatformCompositorOverlay for FakeOverlay {
+        fn set_geometry(&mut self, _: f32, _: f32, _: u32, _: u32) {}
+        fn set_color(&mut self, _: [f32; 4]) {}
+        fn fade_opacity(&mut self, _: f32, _: f64) {}
+        fn animate_opacity_cycle(&mut self, _: &[OpacitySegment]) {}
+        fn hold_opacity(&mut self, _: f32) {}
+        fn is_healthy(&self) -> bool {
+            self.healthy
+        }
+    }
+
+    fn fake(healthy: bool) -> Rc<RefCell<dyn PlatformCompositorOverlay>> {
+        Rc::new(RefCell::new(FakeOverlay { healthy }))
+    }
+
+    #[test]
+    fn an_unhealthy_overlay_is_dropped_so_a_fresh_one_can_be_built() {
+        // BLOCKER (liveness): a failed overlay keeps a visual the compositor
+        // does not show. Serving that handle again would re-assert state onto
+        // nothing forever, so the drop decision must clear it — the caller
+        // then builds a replacement on the same call.
+        let mut slot = Some(fake(false));
+        assert!(drop_unhealthy_overlay(&mut slot));
+        assert!(slot.is_none(), "the dead handle must not stay cached");
+
+        // A healthy overlay is kept: dropping it would needlessly rebuild the
+        // visual and restart its opacity.
+        let healthy = fake(true);
+        let mut slot = Some(healthy.clone());
+        assert!(!drop_unhealthy_overlay(&mut slot));
+        assert!(slot.is_some_and(|current| Rc::ptr_eq(&current, &healthy)));
+
+        // No overlay at all is not a drop.
+        let mut slot: Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> = None;
+        assert!(!drop_unhealthy_overlay(&mut slot));
     }
 }
