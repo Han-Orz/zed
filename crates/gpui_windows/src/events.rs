@@ -154,8 +154,9 @@ impl WindowsWindowInner {
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
-            WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
+            WM_IME_STARTCOMPOSITION => self.handle_ime_start_composition(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
+            WM_IME_REQUEST => self.handle_ime_request(handle, wparam, lparam),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
@@ -648,24 +649,35 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn retrieve_caret_position(&self) -> Option<POINT> {
+    /// The authoritative IME anchor point, in physical client coordinates.
+    ///
+    /// The geometry always comes from the `PlatformInputHandler` queried at
+    /// call time: during an active composition it tracks the composition's
+    /// visible line, otherwise the current selection caret. Nothing is cached.
+    fn ime_anchor_position(&self) -> Option<POINT> {
         self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
-            let caret_range = input_handler.selected_text_range(false)?;
-            let caret_position = input_handler.bounds_for_range(caret_range.range)?;
-            Some(POINT {
-                // logical to physical
-                x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
-                y: (caret_position.origin.y.as_f32() * scale_factor) as i32
-                    + ((caret_position.size.height.as_f32() * scale_factor) as i32 / 2),
-            })
+            let bounds = input_handler.ime_candidate_bounds()?;
+            let (mut origin, line_height) = physical_client_geometry(&bounds, scale_factor);
+            // Anchor the composition/candidate window at the caret's vertical
+            // midline so it sits on the caret's line.
+            origin.y += line_height / 2;
+            Some(origin)
         })
     }
 
-    fn handle_ime_position(&self, handle: HWND) -> Option<isize> {
-        if let Some(caret_position) = self.retrieve_caret_position() {
+    fn handle_ime_start_composition(&self, handle: HWND) -> Option<isize> {
+        self.anchor_ime_position(handle);
+        Some(0)
+    }
+
+    /// Re-anchor the active IME at the current authoritative geometry.
+    ///
+    /// Must be called *after* the input handler state has been updated, so
+    /// the fresh geometry reflects the new composition truth.
+    fn anchor_ime_position(&self, handle: HWND) {
+        if let Some(caret_position) = self.ime_anchor_position() {
             self.update_ime_position(handle, caret_position);
         }
-        Some(0)
     }
 
     pub(crate) fn update_ime_position(&self, handle: HWND, caret_position: POINT) {
@@ -695,6 +707,54 @@ impl WindowsWindowInner {
             .ok()
             .log_err();
         }
+    }
+
+    /// Answer an explicit IME geometry query (`WM_IME_REQUEST`). Only
+    /// `IMR_QUERYCHARPOSITION` is handled; every other request keeps the
+    /// Windows default behavior by falling through to `DefWindowProcW`.
+    fn handle_ime_request(&self, handle: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        match wparam.0 as u32 {
+            IMR_QUERYCHARPOSITION => self.handle_ime_query_char_position(handle, lparam),
+            _ => None,
+        }
+    }
+
+    /// Fill the `IMECHARPOSITION` the IME asked for via `IMR_QUERYCHARPOSITION`.
+    ///
+    /// The requested character is `dwCharPos` (a UTF-16 offset within the
+    /// composition string); it is mapped onto the current marked range to get
+    /// a native UTF-16 position, then queried from the same geometry authority
+    /// as every other IME anchor. `pt` must be in screen coordinates, while
+    /// `cLineHeight` and `rcDocument` are physical pixel sizes/rectangles.
+    /// When the geometry can't be determined, fail closed by answering 0 so
+    /// the IME falls back to its default positioning.
+    fn handle_ime_query_char_position(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        let char_position = unsafe { &mut *(lparam.0 as *mut IMECHARPOSITION) };
+        let Some((bounds, scale_factor)) =
+            self.with_input_handler_and_scale_factor(|input_handler, scale_factor| {
+                let marked_range = input_handler.marked_text_range();
+                let native_position =
+                    composition_char_position(marked_range, char_position.dwCharPos)?;
+                let bounds = input_handler.bounds_for_range(native_position..native_position)?;
+                Some((bounds, scale_factor))
+            })
+        else {
+            return Some(0);
+        };
+
+        let (mut origin, line_height) = physical_client_geometry(&bounds, scale_factor);
+        if !unsafe { ClientToScreen(handle, &mut origin) }.as_bool() {
+            return Some(0);
+        }
+        let Some(document_rect) = client_screen_rect(handle) else {
+            return Some(0);
+        };
+
+        char_position.dwSize = std::mem::size_of::<IMECHARPOSITION>() as u32;
+        char_position.pt = origin;
+        char_position.cLineHeight = line_height.max(0) as u32;
+        char_position.rcDocument = document_rect;
+        Some(1)
     }
 
     fn update_ime_enabled(&self, handle: HWND) {
@@ -729,7 +789,14 @@ impl WindowsWindowInner {
 
     fn handle_ime_composition(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
         let ctx = ImeContext::get(handle)?;
-        self.handle_ime_composition_inner(*ctx, lparam)
+        let result = self.handle_ime_composition_inner(*ctx, lparam);
+        if result == Some(0) {
+            // The composition update just changed the input handler truth;
+            // re-anchor the IME from the fresh geometry so the candidate
+            // window tracks the caret instead of a pre-update position.
+            self.anchor_ime_position(handle);
+        }
+        result
     }
 
     fn handle_ime_composition_inner(&self, ctx: HIMC, lparam: LPARAM) -> Option<isize> {
@@ -1781,6 +1848,61 @@ fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
     at_cursor_is_input || before_cursor_is_input
 }
 
+/// Convert logical glyph bounds into a physical client-space origin and line
+/// height. All Win32 IME geometry structures require physical pixels, so this
+/// is the single logical→physical conversion for the IME anchor paths.
+pub(crate) fn physical_client_geometry(bounds: &Bounds<Pixels>, scale_factor: f32) -> (POINT, i32) {
+    let origin = POINT {
+        x: (bounds.origin.x.as_f32() * scale_factor) as i32,
+        y: (bounds.origin.y.as_f32() * scale_factor) as i32,
+    };
+    let line_height = (bounds.size.height.as_f32() * scale_factor) as i32;
+    (origin, line_height)
+}
+
+/// Map an IME composition-string character offset (`IMECHARPOSITION::dwCharPos`,
+/// a UTF-16 offset within the composition string) onto the current marked
+/// range, yielding the native UTF-16 position to query. Returns `None` when
+/// there is no active composition, so callers fail closed. Offsets past the
+/// composition end (e.g. the caret at the composition end) clamp to the end
+/// of the marked range.
+fn composition_char_position(
+    marked_range: Option<std::ops::Range<usize>>,
+    dw_char_pos: u32,
+) -> Option<usize> {
+    let marked_range = marked_range?;
+    let native_position = marked_range.start.checked_add(dw_char_pos as usize)?;
+    Some(native_position.clamp(marked_range.start, marked_range.end))
+}
+
+/// The window client area in screen coordinates (physical pixels). Used as
+/// the minimal editable-area rectangle for `IMECHARPOSITION::rcDocument` when
+/// no more precise editable surface is available.
+fn client_screen_rect(handle: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(handle, &mut rect) }.ok()?;
+    let mut top_left = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut bottom_right = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    if !unsafe { ClientToScreen(handle, &mut top_left) }.as_bool() {
+        return None;
+    }
+    if !unsafe { ClientToScreen(handle, &mut bottom_right) }.as_bool() {
+        return None;
+    }
+    Some(RECT {
+        left: top_left.x,
+        top: top_left.y,
+        right: bottom_right.x,
+        bottom: bottom_right.y,
+    })
+}
+
 #[inline]
 fn is_virtual_key_pressed(vkey: VIRTUAL_KEY) -> bool {
     unsafe { GetKeyState(vkey.0 as i32) < 0 }
@@ -1839,5 +1961,59 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{composition_char_position, physical_client_geometry};
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn test_composition_char_position_without_composition_fails_closed() {
+        assert_eq!(composition_char_position(None, 0), None);
+        assert_eq!(composition_char_position(None, 7), None);
+    }
+
+    #[test]
+    fn test_composition_char_position_maps_within_marked_range() {
+        let marked_range = Some(10..20);
+        // first composition character
+        assert_eq!(composition_char_position(marked_range.clone(), 0), Some(10));
+        // a middle composition character
+        assert_eq!(composition_char_position(marked_range.clone(), 5), Some(15));
+        // the caret at the composition end
+        assert_eq!(
+            composition_char_position(marked_range.clone(), 10),
+            Some(20)
+        );
+        // out-of-range offsets stay inside the marked range
+        assert_eq!(composition_char_position(marked_range, 999), Some(20));
+    }
+
+    #[test]
+    fn test_composition_char_position_overflow_fails_closed() {
+        assert_eq!(
+            composition_char_position(Some(usize::MAX..usize::MAX), u32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn test_physical_client_geometry() {
+        let bounds = Bounds {
+            origin: point(px(10.5), px(20.5)),
+            size: size(px(100.0), px(24.0)),
+        };
+        let (origin, line_height) = physical_client_geometry(&bounds, 1.0);
+        assert_eq!(origin.x, 10);
+        assert_eq!(origin.y, 20);
+        assert_eq!(line_height, 24);
+
+        // at 200% the bounds scale to physical pixels
+        let (origin, line_height) = physical_client_geometry(&bounds, 2.0);
+        assert_eq!(origin.x, 21);
+        assert_eq!(origin.y, 41);
+        assert_eq!(line_height, 48);
     }
 }

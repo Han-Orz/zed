@@ -1040,12 +1040,9 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
-        let scale_factor = self.state.scale_factor.get();
-        let caret_position = POINT {
-            x: (bounds.origin.x.as_f32() * scale_factor) as i32,
-            y: (bounds.origin.y.as_f32() * scale_factor) as i32
-                + ((bounds.size.height.as_f32() * scale_factor) as i32 / 2),
-        };
+        let (mut caret_position, line_height) =
+            physical_client_geometry(&bounds, self.state.scale_factor.get());
+        caret_position.y += line_height / 2;
 
         self.0.update_ime_position(self.0.hwnd, caret_position);
     }
