@@ -2786,6 +2786,23 @@ impl Window {
         self.active.get()
     }
 
+    /// Monotonic count of this window's renderer presents. Diagnostics
+    /// evidence only; platforms without a renderer report zero.
+    pub fn present_count(&self) -> u64 {
+        self.platform_window.present_count()
+    }
+
+    /// The window's compositor overlay visual, when the platform supports
+    /// one. The overlay is presentation-only platform content the compositor
+    /// can position and animate without the app rendering a frame; it never
+    /// receives input and never touches the window's scene.
+    #[cfg(target_os = "windows")]
+    pub fn compositor_overlay(
+        &self,
+    ) -> Option<Rc<RefCell<dyn crate::platform::PlatformCompositorOverlay>>> {
+        self.platform_window.compositor_overlay()
+    }
+
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
     /// On mac, this is equivalent to `is_window_active`.

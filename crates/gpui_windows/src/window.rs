@@ -1019,6 +1019,14 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn present_count(&self) -> u64 {
+        self.state.renderer.borrow().present_count()
+    }
+
+    fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
+        self.state.renderer.borrow_mut().compositor_overlay()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state

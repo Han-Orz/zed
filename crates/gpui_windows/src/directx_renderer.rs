@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -44,6 +45,8 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    overlay: Option<Rc<CompositorOverlay>>,
+    present_count: u64,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -190,6 +193,8 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            overlay: None,
+            present_count: 0,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -199,6 +204,31 @@ impl DirectXRenderer {
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    /// The window's compositor overlay visual, created lazily on first use.
+    /// Returns `None` when DirectComposition is unavailable.
+    pub(crate) fn compositor_overlay(
+        &mut self,
+    ) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
+        let devices = self.devices.as_ref()?;
+        let composition = self.direct_composition.as_ref()?;
+        if self.overlay.is_none() {
+            match CompositorOverlay::new(devices, composition) {
+                Ok(overlay) => self.overlay = Some(overlay),
+                Err(error) => {
+                    log::error!("Creating compositor overlay failed: {error}");
+                    return None;
+                }
+            }
+        }
+        self.overlay
+            .clone()
+            .map(|overlay| overlay as Rc<RefCell<dyn PlatformCompositorOverlay>>)
+    }
+
+    pub(crate) fn present_count(&self) -> u64 {
+        self.present_count
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
@@ -243,6 +273,7 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
+        self.present_count += 1;
         let result = unsafe {
             self.resources
                 .as_ref()
@@ -309,6 +340,14 @@ impl DirectXRenderer {
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
+
+        if let Some(overlay) = &self.overlay
+            && let Some(composition) = direct_composition.as_ref()
+        {
+            overlay
+                .rebuild(&devices, composition)
+                .context("Rebuilding compositor overlay")?;
+        }
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
@@ -1025,6 +1064,14 @@ impl DirectComposition {
             self.comp_device.Commit()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn comp_device(&self) -> &IDCompositionDevice {
+        &self.comp_device
+    }
+
+    pub(crate) fn root_visual(&self) -> &IDCompositionVisual {
+        &self.comp_visual
     }
 }
 

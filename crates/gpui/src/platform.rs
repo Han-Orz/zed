@@ -59,6 +59,7 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
@@ -872,6 +873,58 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// The interpolation shape of one [`OpacitySegment`]. The platform maps
+/// these to whatever its compositor supports natively; on DirectComposition
+/// both map to polynomial animation segments.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OpacityEase {
+    /// The value stays constant across the segment.
+    Hold,
+    /// The value moves from the segment's start value to its end value with a
+    /// symmetric ease-in-out profile.
+    Smooth,
+}
+
+/// One constant-or-eased span of a compositor-run opacity animation.
+///
+/// Times are seconds from the animation's start; the first segment must start
+/// at zero and segments must be contiguous and ordered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpacitySegment {
+    /// Seconds from the animation's start where this segment begins.
+    pub start_s: f64,
+    /// Seconds from the animation's start where this segment ends.
+    pub end_s: f64,
+    /// The opacity when the segment begins.
+    pub start_value: f32,
+    /// The opacity when the segment ends.
+    pub end_value: f32,
+    /// How the value moves between the segment's ends.
+    pub ease: OpacityEase,
+}
+
+/// A small compositor-owned overlay visual: platform content the compositor
+/// can position, color and animate without the app rendering a frame.
+///
+/// It is presentation-only: it never receives input and never touches the
+/// window's scene. All methods run on the main thread.
+pub trait PlatformCompositorOverlay {
+    /// Place the overlay at a physical-pixel rectangle in window coordinates,
+    /// recreating the content when the size changes.
+    fn set_geometry(&mut self, x: i32, y: i32, width: u32, height: u32);
+    /// Fill the overlay with a solid non-premultiplied color.
+    fn set_color(&mut self, color: [f32; 4]);
+    /// Show or hide the overlay.
+    fn set_visible(&mut self, visible: bool);
+    /// Replace the overlay's static opacity with a compositor-run animation
+    /// that plays `segments` once from the next commit and then repeats the
+    /// whole cycle indefinitely. The compositor executes the animation; the
+    /// app is not woken while it runs.
+    fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]);
+    /// Stop any compositor-run animation and hold a static opacity.
+    fn set_static_opacity(&mut self, opacity: f32);
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -954,6 +1007,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Monotonic count of renderer presents for this window. Diagnostics
+    /// evidence only; platforms without a renderer report zero.
+    fn present_count(&self) -> u64 {
+        0
+    }
+    /// The window's compositor overlay visual, when the platform supports
+    /// one. Returns the same handle for every call on a window.
+    #[cfg(target_os = "windows")]
+    fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
+        None
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
