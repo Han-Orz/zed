@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    rc::Rc,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -45,7 +46,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
-    overlay: Option<Rc<CompositorOverlay>>,
+    overlay: Option<Rc<RefCell<CompositorOverlay>>>,
     present_count: u64,
     font_info: &'static FontInfo,
 
@@ -118,7 +119,7 @@ impl Drop for Annotation<'_> {
     }
 }
 
-struct DirectComposition {
+pub(crate) struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
     comp_visual: IDCompositionVisual,
@@ -222,9 +223,9 @@ impl DirectXRenderer {
                 }
             }
         }
-        self.overlay
-            .clone()
-            .map(|overlay| overlay as Rc<RefCell<dyn PlatformCompositorOverlay>>)
+        let overlay = self.overlay.clone()?;
+        let overlay: Rc<RefCell<dyn PlatformCompositorOverlay>> = overlay;
+        Some(overlay)
     }
 
     pub(crate) fn present_count(&self) -> u64 {
@@ -344,9 +345,13 @@ impl DirectXRenderer {
         if let Some(overlay) = &self.overlay
             && let Some(composition) = direct_composition.as_ref()
         {
-            overlay
+            if let Err(error) = overlay
+                .borrow_mut()
                 .rebuild(&devices, composition)
-                .context("Rebuilding compositor overlay")?;
+                .context("Rebuilding compositor overlay")
+            {
+                log::error!("{error:#}");
+            }
         }
 
         self.atlas
