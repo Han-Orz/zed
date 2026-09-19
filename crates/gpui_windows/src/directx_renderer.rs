@@ -1338,7 +1338,15 @@ impl Drop for DirectXRenderer {
 
 #[inline]
 fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
-    Ok(unsafe { DCompositionCreateDevice(dxgi_device)? })
+    // Create the newest device version that still speaks the v1 interface.
+    // A legacy `DCompositionCreateDevice` device produces visuals that do not
+    // implement `IDCompositionVisual3` (E_NOINTERFACE), which the compositor
+    // overlay needs for compositor-run opacity animation. The v1 interface
+    // itself (CreateTargetForHwnd, CreateVisual, Commit) is unchanged.
+    Ok(unsafe {
+        DCompositionCreateDevice3(dxgi_device)
+            .or_else(|_| DCompositionCreateDevice(dxgi_device))?
+    })
 }
 
 fn create_swap_chain_for_composition(
