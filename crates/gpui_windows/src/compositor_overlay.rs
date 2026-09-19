@@ -192,14 +192,29 @@ impl CompositorOverlay {
         if width > 0 && height > 0 {
             self.set_geometry_impl(x, y, width, height)?;
         }
-        // The animation died with the lost device. A breathing cycle starts
-        // again; anything else holds the opacity the visual was showing, so
-        // the overlay comes back looking the way it left.
-        if let Motion::Breathe { segments, .. } = &self.motion {
-            let segments = segments.clone();
-            return self.breathe_impl(&segments);
+        // The animation died with the lost device, so it is replayed from the
+        // value the visual was showing: a breathing cycle starts again, a fade
+        // finishes its remaining time toward the same target, anything else
+        // holds. Holding a fade here would strand the overlay half faded.
+        let now = Instant::now();
+        match &self.motion {
+            Motion::Breathe { segments, .. } => {
+                let segments = segments.clone();
+                self.breathe_impl(&segments)
+            }
+            Motion::Fade {
+                to,
+                started,
+                duration_s,
+                ..
+            } => {
+                let remaining_s =
+                    duration_s - now.saturating_duration_since(*started).as_secs_f64();
+                let to = *to;
+                self.fade_impl(to, remaining_s)
+            }
+            Motion::Hold(_) => self.hold_impl(self.motion.value_at(now)),
         }
-        self.hold_impl(self.motion.value_at(Instant::now()))
     }
 
     /// Stop any compositor animation and hold `opacity`.
