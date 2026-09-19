@@ -1019,6 +1019,7 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    #[cfg(feature = "diagnostics")]
     fn present_count(&self) -> u64 {
         self.state.renderer.borrow().present_count()
     }

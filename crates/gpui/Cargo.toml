@@ -41,6 +41,10 @@ screen-capture = [
 windows-manifest = ["dep:embed-resource"]
 profiler = ["dep:hdrhistogram"]
 stacker = ["dep:stacksafe"]
+# Diagnostic Release support for consumers that prove presentation behaviour
+# (e.g. zenTypeNext's DebugKit). Off in a production build: the platform's
+# evidence counters are then not maintained at all.
+diagnostics = []
 
 [lib]
 path = "src/gpui.rs"

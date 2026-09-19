@@ -2787,7 +2787,8 @@ impl Window {
     }
 
     /// Monotonic count of this window's renderer presents. Diagnostics
-    /// evidence only; platforms without a renderer report zero.
+    /// evidence only, and present only in a build that keeps it.
+    #[cfg(feature = "diagnostics")]
     pub fn present_count(&self) -> u64 {
         self.platform_window.present_count()
     }

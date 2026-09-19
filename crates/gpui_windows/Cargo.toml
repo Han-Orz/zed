@@ -13,6 +13,8 @@ path = "src/gpui_windows.rs"
 
 [features]
 default = ["gpui/default"]
+# Keep the platform's presentation evidence counters (Diagnostic Release).
+diagnostics = ["gpui/diagnostics"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
 

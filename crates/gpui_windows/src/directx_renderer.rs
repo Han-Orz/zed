@@ -47,6 +47,7 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     overlay: Option<Rc<RefCell<CompositorOverlay>>>,
+    #[cfg(feature = "diagnostics")]
     present_count: u64,
     font_info: &'static FontInfo,
 
@@ -195,6 +196,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             overlay: None,
+            #[cfg(feature = "diagnostics")]
             present_count: 0,
             font_info: Self::get_font_info(),
             width: 1,
@@ -228,6 +230,9 @@ impl DirectXRenderer {
         Some(overlay)
     }
 
+    /// Monotonic renderer present count, maintained only in a build that keeps
+    /// the platform's presentation evidence (Diagnostic Release).
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn present_count(&self) -> u64 {
         self.present_count
     }
@@ -274,7 +279,10 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
-        self.present_count += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.present_count += 1;
+        }
         let result = unsafe {
             self.resources
                 .as_ref()

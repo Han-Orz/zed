@@ -914,15 +914,18 @@ pub trait PlatformCompositorOverlay {
     fn set_geometry(&mut self, x: i32, y: i32, width: u32, height: u32);
     /// Fill the overlay with a solid non-premultiplied color.
     fn set_color(&mut self, color: [f32; 4]);
-    /// Show or hide the overlay.
-    fn set_visible(&mut self, visible: bool);
-    /// Replace the overlay's static opacity with a compositor-run animation
-    /// that plays `segments` once from the next commit and then repeats the
-    /// whole cycle indefinitely. The compositor executes the animation; the
-    /// app is not woken while it runs.
+    /// Move the overlay to `target` opacity over `duration_s` seconds, from
+    /// whatever opacity it shows right now, and hold it there. The compositor
+    /// runs the fade; the app is not woken while it plays. `target` zero is a
+    /// hidden overlay, reached by fading rather than by snapping it off.
+    fn fade_opacity(&mut self, target: f32, duration_s: f64);
+    /// Replace whatever opacity animation is running with a compositor-run
+    /// animation that plays `segments` once from the next commit and then
+    /// repeats the whole cycle indefinitely. The compositor executes the
+    /// animation; the app is not woken while it runs.
     fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]);
-    /// Stop any compositor-run animation and hold a static opacity.
-    fn set_static_opacity(&mut self, opacity: f32);
+    /// Stop any opacity animation and hold `opacity`.
+    fn hold_opacity(&mut self, opacity: f32);
 }
 
 #[expect(missing_docs)]
@@ -1008,7 +1011,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
     /// Monotonic count of renderer presents for this window. Diagnostics
-    /// evidence only; platforms without a renderer report zero.
+    /// evidence only; platforms without a renderer report zero, and a build
+    /// without `diagnostics` maintains no counter at all.
+    #[cfg(feature = "diagnostics")]
     fn present_count(&self) -> u64 {
         0
     }

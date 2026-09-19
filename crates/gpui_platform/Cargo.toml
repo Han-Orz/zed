@@ -14,6 +14,9 @@ path = "src/gpui_platform.rs"
 [features]
 default = []
 bench-support = ["gpui/bench-support", "gpui_macos/bench-support"]
+# Keep the Windows renderer's presentation evidence counters (Diagnostic
+# Release of a consumer such as zenTypeNext). Off in a production build.
+diagnostics = ["gpui/diagnostics", "gpui_windows/diagnostics"]
 font-kit = ["gpui_macos/font-kit"]
 test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]

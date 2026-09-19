@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use gpui::{OpacityEase, OpacitySegment, PlatformCompositorOverlay};
@@ -45,8 +46,84 @@ pub(crate) struct CompositorOverlay {
     width: u32,
     height: u32,
     color: [f32; 4],
-    visible: bool,
-    opacity: f32,
+    /// What the compositor was last told to play. It is also the overlay's
+    /// remembered opacity: a rebuild restores the value this motion holds or
+    /// is passing through, so the overlay never comes back at a stale one.
+    motion: Motion,
+}
+
+/// What the compositor is playing on the overlay's opacity. DirectComposition
+/// exposes no getter for an animated value, so the overlay remembers the motion
+/// it scheduled and derives the value on screen when the next motion has to
+/// start from it instead of from a stale target.
+enum Motion {
+    /// A constant value, held.
+    Hold(f32),
+    /// A one-shot fade in flight.
+    Fade {
+        from: f32,
+        to: f32,
+        started: Instant,
+        duration_s: f64,
+    },
+    /// The breathing cycle, repeating from `started`.
+    Breathe {
+        started: Instant,
+        segments: Vec<OpacitySegment>,
+    },
+}
+
+impl Motion {
+    /// The opacity the visual shows at `now`.
+    fn value_at(&self, now: Instant) -> f32 {
+        match self {
+            Motion::Hold(value) => *value,
+            Motion::Fade {
+                from,
+                to,
+                started,
+                duration_s,
+            } => {
+                let elapsed = now.saturating_duration_since(*started).as_secs_f64();
+                if *duration_s <= 0.0 || elapsed >= *duration_s {
+                    return *to;
+                }
+                from + (to - from) * smoothstep(elapsed / duration_s)
+            }
+            Motion::Breathe { started, segments } => {
+                let Some(last) = segments.last() else {
+                    return 0.0;
+                };
+                let cycle = last.end_s;
+                if cycle <= 0.0 {
+                    return last.end_value;
+                }
+                let t = now.saturating_duration_since(*started).as_secs_f64() % cycle;
+                let segment = segments
+                    .iter()
+                    .find(|segment| t < segment.end_s)
+                    .unwrap_or(last);
+                let duration = segment.end_s - segment.start_s;
+                match segment.ease {
+                    OpacityEase::Hold => segment.end_value,
+                    OpacityEase::Smooth if duration > 0.0 => {
+                        let u = (t - segment.start_s) / duration;
+                        segment.start_value
+                            + (segment.end_value - segment.start_value) * smoothstep(u)
+                    }
+                    OpacityEase::Smooth => segment.end_value,
+                }
+            }
+        }
+    }
+}
+
+/// The symmetric ease-in-out curve the fade and the breathing fade segments
+/// both use, kept in one place so the overlay's estimate of an in-flight
+/// animation matches what the compositor is executing.
+fn smoothstep(u: f64) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    (u * u * (3.0 - 2.0 * u)) as f32
 }
 
 impl CompositorOverlay {
@@ -80,19 +157,20 @@ impl CompositorOverlay {
             width: 0,
             height: 0,
             color: [0.0, 0.0, 0.0, 1.0],
-            visible: false,
-            opacity: 1.0,
+            // Created invisible: the app's first fade brings it in.
+            motion: Motion::Hold(0.0),
         })))
     }
 
     /// Recreate the overlay's composition resources on a fresh DirectComposition
-    /// device after device loss, preserving the app's geometry, color,
-    /// visibility and opacity state. The `Rc` the app holds stays valid.
+    /// device after device loss, preserving the app's geometry, color and
+    /// opacity state. The `Rc` the app holds stays valid.
     pub(crate) fn rebuild(
         &mut self,
         devices: &DirectXRendererDevices,
         composition: &DirectComposition,
     ) -> Result<()> {
+        let (x, y, width, height) = (self.x, self.y, self.width, self.height);
         let visual = unsafe { composition.comp_device().CreateVisual() }?;
         let opacity_visual: IDCompositionVisual3 = visual.cast()?;
         self.comp_device = composition.comp_device().clone();
@@ -100,19 +178,35 @@ impl CompositorOverlay {
         self.device_context = devices.device_context.clone();
         self.visual = visual.clone();
         self.opacity_visual = opacity_visual;
+        // The content surface belonged to the lost device; the geometry the app
+        // committed did not. Clearing the remembered size makes the geometry
+        // call below recreate the content at that committed size instead of
+        // leaving the overlay contentless.
         self.surface = None;
-        // Reset the size so the next geometry call recreates the content.
         self.width = 0;
         self.height = 0;
         unsafe {
             visual.SetContent(None::<&windows::core::IUnknown>)?;
             composition.root_visual().AddVisual(&visual, true, None)?;
         }
-        if self.visible && self.width > 0 && self.height > 0 {
-            self.set_geometry_impl(self.x, self.y, self.width, self.height)?;
+        if width > 0 && height > 0 {
+            self.set_geometry_impl(x, y, width, height)?;
         }
-        self.set_visible_impl(self.visible)?;
-        self.set_static_opacity_impl(self.opacity)
+        // The animation died with the lost device. A breathing cycle starts
+        // again; anything else holds the opacity the visual was showing, so
+        // the overlay comes back looking the way it left.
+        if let Motion::Breathe { segments, .. } = &self.motion {
+            let segments = segments.clone();
+            return self.breathe_impl(&segments);
+        }
+        self.hold_impl(self.motion.value_at(Instant::now()))
+    }
+
+    /// Stop any compositor animation and hold `opacity`.
+    fn hold_impl(&mut self, opacity: f32) -> Result<()> {
+        self.motion = Motion::Hold(opacity);
+        unsafe { self.opacity_visual.SetOpacity2(opacity)? };
+        self.commit()
     }
 
     fn commit(&self) -> Result<()> {
@@ -186,16 +280,38 @@ impl CompositorOverlay {
         self.commit()
     }
 
-    fn set_visible_impl(&mut self, visible: bool) -> Result<()> {
-        self.visible = visible;
+    /// Fade to `target` over `duration_s`, starting from the opacity on screen
+    /// right now — the tail of a previous fade or the phase of a running
+    /// breathing cycle — so no transition ever snaps.
+    fn fade_impl(&mut self, target: f32, duration_s: f64) -> Result<()> {
+        let now = Instant::now();
+        let from = self.motion.value_at(now);
+        if duration_s <= 0.0 || from == target {
+            return self.hold_impl(target);
+        }
+        let animation = unsafe { self.comp_device.CreateAnimation()? };
+        // The same smoothstep the breathing fade segments use.
+        let delta = f64::from(target - from);
         unsafe {
-            self.opacity_visual
-                .SetOpacity2(if visible { self.opacity } else { 0.0 })?
+            animation.AddCubic(
+                0.0,
+                from,
+                0.0,
+                (3.0 * delta / (duration_s * duration_s)) as f32,
+                (-2.0 * delta / (duration_s * duration_s * duration_s)) as f32,
+            )?
+        };
+        unsafe { self.opacity_visual.SetOpacity(&animation)? };
+        self.motion = Motion::Fade {
+            from,
+            to: target,
+            started: now,
+            duration_s,
         };
         self.commit()
     }
 
-    fn animate_opacity_cycle_impl(&mut self, segments: &[OpacitySegment]) -> Result<()> {
+    fn breathe_impl(&mut self, segments: &[OpacitySegment]) -> Result<()> {
         let Some(last) = segments.last() else {
             return Ok(());
         };
@@ -227,14 +343,9 @@ impl CompositorOverlay {
         // repeat as the last segment stays in effect with no end.
         unsafe { animation.AddRepeat(last.end_s, last.end_s)? };
         unsafe { self.opacity_visual.SetOpacity(&animation)? };
-        self.commit()
-    }
-
-    fn set_static_opacity_impl(&mut self, opacity: f32) -> Result<()> {
-        self.opacity = opacity;
-        unsafe {
-            self.opacity_visual
-                .SetOpacity2(if self.visible { opacity } else { 0.0 })?
+        self.motion = Motion::Breathe {
+            started: Instant::now(),
+            segments: segments.to_vec(),
         };
         self.commit()
     }
@@ -253,21 +364,21 @@ impl PlatformCompositorOverlay for CompositorOverlay {
         }
     }
 
-    fn set_visible(&mut self, visible: bool) {
-        if let Err(error) = self.set_visible_impl(visible) {
-            log::error!("compositor overlay set_visible failed: {error}");
+    fn fade_opacity(&mut self, target: f32, duration_s: f64) {
+        if let Err(error) = self.fade_impl(target, duration_s) {
+            log::error!("compositor overlay fade_opacity failed: {error}");
         }
     }
 
     fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]) {
-        if let Err(error) = self.animate_opacity_cycle_impl(segments) {
+        if let Err(error) = self.breathe_impl(segments) {
             log::error!("compositor overlay animate_opacity_cycle failed: {error}");
         }
     }
 
-    fn set_static_opacity(&mut self, opacity: f32) {
-        if let Err(error) = self.set_static_opacity_impl(opacity) {
-            log::error!("compositor overlay set_static_opacity failed: {error}");
+    fn hold_opacity(&mut self, opacity: f32) {
+        if let Err(error) = self.hold_impl(opacity) {
+            log::error!("compositor overlay hold_opacity failed: {error}");
         }
     }
 }
