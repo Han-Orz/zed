@@ -247,7 +247,10 @@ impl CompositorOverlay {
         let update: IDXGISurface1 = unsafe { surface.BeginDraw(Some(&rect), &mut offset)? };
         let texture: ID3D11Texture2D = update.cast()?;
         let mut render_target_view: Option<ID3D11RenderTargetView> = None;
-        unsafe { self.device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
+        unsafe {
+            self.device
+                .CreateRenderTargetView(&texture, None, Some(&mut render_target_view))?
+        };
         let render_target_view = render_target_view.context("no render target view")?;
         let [r, g, b, a] = color;
         // Premultiplied alpha: the surface's alpha mode is premultiplied.

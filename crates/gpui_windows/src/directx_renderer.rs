@@ -1352,8 +1352,7 @@ fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
     // overlay needs for compositor-run opacity animation. The v1 interface
     // itself (CreateTargetForHwnd, CreateVisual, Commit) is unchanged.
     Ok(unsafe {
-        DCompositionCreateDevice3(dxgi_device)
-            .or_else(|_| DCompositionCreateDevice(dxgi_device))?
+        DCompositionCreateDevice3(dxgi_device).or_else(|_| DCompositionCreateDevice(dxgi_device))?
     })
 }
 
