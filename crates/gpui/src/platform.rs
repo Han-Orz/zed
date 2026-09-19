@@ -909,9 +909,14 @@ pub struct OpacitySegment {
 /// It is presentation-only: it never receives input and never touches the
 /// window's scene. All methods run on the main thread.
 pub trait PlatformCompositorOverlay {
-    /// Place the overlay at a physical-pixel rectangle in window coordinates,
-    /// recreating the content when the size changes.
-    fn set_geometry(&mut self, x: i32, y: i32, width: u32, height: u32);
+    /// Place the overlay at a rectangle in window coordinates, recreating the
+    /// content when the size changes.
+    ///
+    /// The position is in physical pixels and fractional: the compositor
+    /// places visuals at sub-pixel offsets, which is what lets an app-side
+    /// animation land between two pixels. The size is whole physical pixels
+    /// because it is the raster size of the overlay's content.
+    fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32);
     /// Fill the overlay with a solid non-premultiplied color.
     fn set_color(&mut self, color: [f32; 4]);
     /// Move the overlay to `target` opacity over `duration_s` seconds, from

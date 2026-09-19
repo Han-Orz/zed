@@ -41,8 +41,8 @@ pub(crate) struct CompositorOverlay {
     opacity_visual: IDCompositionVisual3,
     surface: Option<IDCompositionSurface>,
 
-    x: i32,
-    y: i32,
+    x: f32,
+    y: f32,
     width: u32,
     height: u32,
     color: [f32; 4],
@@ -152,8 +152,8 @@ impl CompositorOverlay {
             opacity_visual,
             visual,
             surface: None,
-            x: 0,
-            y: 0,
+            x: 0.0,
+            y: 0.0,
             width: 0,
             height: 0,
             color: [0.0, 0.0, 0.0, 1.0],
@@ -279,14 +279,16 @@ impl CompositorOverlay {
         Ok(())
     }
 
-    fn set_geometry_impl(&mut self, x: i32, y: i32, width: u32, height: u32) -> Result<()> {
+    fn set_geometry_impl(&mut self, x: f32, y: f32, width: u32, height: u32) -> Result<()> {
         if self.width != width || self.height != height {
             self.recreate_surface(width, height)?;
         }
         self.x = x;
         self.y = y;
-        unsafe { self.visual.SetOffsetX2(x as f32)? };
-        unsafe { self.visual.SetOffsetY2(y as f32)? };
+        // The compositor places the visual at a sub-pixel offset: an animated
+        // position is not rounded to whole pixels here.
+        unsafe { self.visual.SetOffsetX2(x)? };
+        unsafe { self.visual.SetOffsetY2(y)? };
         self.commit()
     }
 
@@ -370,7 +372,7 @@ impl CompositorOverlay {
 }
 
 impl PlatformCompositorOverlay for CompositorOverlay {
-    fn set_geometry(&mut self, x: i32, y: i32, width: u32, height: u32) {
+    fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32) {
         if let Err(error) = self.set_geometry_impl(x, y, width, height) {
             log::error!("compositor overlay set_geometry failed: {error}");
         }
