@@ -931,14 +931,6 @@ pub trait PlatformCompositorOverlay {
     fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]);
     /// Stop any opacity animation and hold `opacity`.
     fn hold_opacity(&mut self, opacity: f32);
-    /// Whether this overlay is still usable. An implementation marks itself
-    /// unhealthy when a compositor operation fails and its state can no
-    /// longer be trusted; the renderer then drops the handle so the next
-    /// request builds a fresh overlay instead of caching a dead visual
-    /// forever. Overlays with no failure state are healthy by definition.
-    fn is_healthy(&self) -> bool {
-        true
-    }
 }
 
 #[expect(missing_docs)]
@@ -1031,24 +1023,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         0
     }
     /// The window's compositor overlay visual, when the platform supports
-    /// one. Returns the same handle for every call on a window — except when
-    /// the renderer dropped a dead overlay, in which case this call builds a
-    /// fresh one and returns its handle.
+    /// one. Returns the same handle for every call on a window.
     #[cfg(target_os = "windows")]
     fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
         None
-    }
-    /// Monotonic count of compositor overlays this window has created, and of
-    /// device-lost rebuild failures. Diagnostics evidence only; platforms
-    /// without a compositor overlay report zero, and a build without
-    /// `diagnostics` maintains no counters at all.
-    #[cfg(feature = "diagnostics")]
-    fn compositor_overlay_generation(&self) -> u64 {
-        0
-    }
-    #[cfg(feature = "diagnostics")]
-    fn compositor_overlay_rebuild_failures(&self) -> u64 {
-        0
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

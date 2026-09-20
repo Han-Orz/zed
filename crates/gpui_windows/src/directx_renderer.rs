@@ -49,12 +49,6 @@ pub(crate) struct DirectXRenderer {
     overlay: Option<Rc<RefCell<CompositorOverlay>>>,
     #[cfg(feature = "diagnostics")]
     present_count: u64,
-    /// Monotonic count of overlays created, and of device-lost rebuild
-    /// failures. Diagnostics evidence only.
-    #[cfg(feature = "diagnostics")]
-    overlay_generation: u64,
-    #[cfg(feature = "diagnostics")]
-    overlay_rebuild_failures: u64,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -204,10 +198,6 @@ impl DirectXRenderer {
             overlay: None,
             #[cfg(feature = "diagnostics")]
             present_count: 0,
-            #[cfg(feature = "diagnostics")]
-            overlay_generation: 0,
-            #[cfg(feature = "diagnostics")]
-            overlay_rebuild_failures: 0,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -221,30 +211,14 @@ impl DirectXRenderer {
 
     /// The window's compositor overlay visual, created lazily on first use.
     /// Returns `None` when DirectComposition is unavailable.
-    ///
-    /// A cached overlay that reported an operation failure is dead — its
-    /// remembered state no longer describes what the compositor shows — so it
-    /// is dropped here and a fresh one is built for this very call. The
-    /// caller can tell the handle changed by its `Rc` identity and re-assert
-    /// its full geometry, color and visibility; nothing keeps handing out a
-    /// dead visual.
     pub(crate) fn compositor_overlay(
         &mut self,
     ) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
-        if crate::compositor_overlay::drop_unhealthy_overlay(&mut self.overlay) {
-            log::warn!("Dropping unhealthy compositor overlay; a fresh one is created");
-        }
         let devices = self.devices.as_ref()?;
         let composition = self.direct_composition.as_ref()?;
         if self.overlay.is_none() {
             match CompositorOverlay::new(devices, composition) {
-                Ok(overlay) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.overlay_generation += 1;
-                    }
-                    self.overlay = Some(overlay);
-                }
+                Ok(overlay) => self.overlay = Some(overlay),
                 Err(error) => {
                     log::error!("Creating compositor overlay failed: {error}");
                     return None;
@@ -261,18 +235,6 @@ impl DirectXRenderer {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn present_count(&self) -> u64 {
         self.present_count
-    }
-
-    /// How many overlays this renderer has created (Diagnostic Release only).
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn overlay_generation(&self) -> u64 {
-        self.overlay_generation
-    }
-
-    /// How many device-lost overlay rebuilds failed (Diagnostic Release only).
-    #[cfg(feature = "diagnostics")]
-    pub(crate) fn overlay_rebuild_failures(&self) -> u64 {
-        self.overlay_rebuild_failures
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
@@ -397,10 +359,6 @@ impl DirectXRenderer {
                 .context("Rebuilding compositor overlay")
             {
                 log::error!("{error:#}");
-                #[cfg(feature = "diagnostics")]
-                {
-                    self.overlay_rebuild_failures += 1;
-                }
             }
         }
 
