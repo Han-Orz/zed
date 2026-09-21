@@ -915,12 +915,15 @@ pub trait PlatformCompositorOverlay {
     /// visuals at sub-pixel offsets, which is what lets an app-side animation land
     /// between two pixels, and it applies on every call.
     ///
-    /// The size is whole physical pixels, and a solid color is placed at whatever
-    /// size is asked for. An image is shown at its own raster size instead, so a
-    /// placement an image does not fill leaves the image — and the surface holding
-    /// it — complete and unchanged until the image for that size arrives, which is
-    /// one `set_content_rgba` call away. No order of the two calls can leave the
-    /// overlay holding content that does not cover the surface showing it.
+    /// The size is whole physical pixels. It is remembered as the overlay's
+    /// placement, and an overlay is shown at the size its content can fill: a
+    /// solid color fills whatever size is asked for, while an image is shown at
+    /// its own raster size instead. A placement an image does not fill therefore
+    /// leaves the image — and the surface holding it — complete and unchanged
+    /// until the image for that size arrives, which is one `set_content_rgba` call
+    /// away, and the placement still stands for a later solid color and for a
+    /// rebuild after device loss. No order of the two calls can leave the overlay
+    /// holding content that does not cover the surface showing it.
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32);
     /// Replace the overlay's content with a small raster image: tightly packed
     /// premultiplied RGBA8 pixels, exactly `width * height * 4` bytes in row-major

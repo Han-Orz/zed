@@ -46,6 +46,12 @@ pub(crate) struct CompositorOverlay {
 
     x: f32,
     y: f32,
+    /// The size the app last asked the overlay to be placed at. A solid color
+    /// fills it, and a rebuild restores it; zero while the app has never placed
+    /// the overlay.
+    placement: (u32, u32),
+    /// The size of the surface the overlay currently has attached, which is the
+    /// size the remembered content is shown at.
     width: u32,
     height: u32,
     content: Content,
@@ -173,18 +179,32 @@ fn content_pixels(content: &Content, width: u32, height: u32) -> Vec<u8> {
     }
 }
 
-/// The size the overlay shows `content` at when it is placed at `placed`.
+/// The size the overlay shows `content` at when the app has placed it at
+/// `placement`.
 ///
 /// This is the whole resize contract in one expression: a solid color fills
 /// whatever size it is placed at, while an image is exactly its own raster size,
-/// because this overlay never scales one. A placement that an image does not fill
-/// is therefore not applied to the surface — the image, and the surface holding
-/// it, stay complete until the image for that size arrives, which is one
-/// `set_content_rgba` call away.
-fn shown_size(content: &Content, placed: (u32, u32)) -> (u32, u32) {
+/// because this overlay never scales one. A placement an image does not fill is
+/// therefore not applied to the surface — the image, and the surface holding it,
+/// stay complete until the image for that size arrives, which is one
+/// `set_content_rgba` call away. The placement is remembered either way, so a
+/// solid color that replaces that image, or a rebuild, still lands on the size
+/// the app asked for.
+fn shown_size(content: &Content, placement: (u32, u32)) -> (u32, u32) {
     match content {
-        Content::Solid(_) => placed,
+        Content::Solid(_) => placement,
         Content::Rgba { width, height, .. } => (*width, *height),
+    }
+}
+
+/// The size a device-loss rebuild restores the surface at, or `None` for an
+/// overlay the app has never placed: that overlay has no surface to restore,
+/// whatever content it remembers.
+fn rebuilt_size(content: &Content, placement: (u32, u32)) -> Option<(u32, u32)> {
+    if placement.0 > 0 && placement.1 > 0 {
+        Some(shown_size(content, placement))
+    } else {
+        None
     }
 }
 
@@ -217,6 +237,7 @@ impl CompositorOverlay {
             surface: None,
             x: 0.0,
             y: 0.0,
+            placement: (0, 0),
             width: 0,
             height: 0,
             content: Content::Solid([0.0, 0.0, 0.0, 1.0]),
@@ -233,10 +254,9 @@ impl CompositorOverlay {
         devices: &DirectXRendererDevices,
         composition: &DirectComposition,
     ) -> Result<()> {
-        // The size the overlay was showing at, captured before the rebuild clears
-        // it: the surface comes back from the remembered content, so its size is
-        // the size that content is shown at rather than one a placement asked for.
-        let placed = (self.width, self.height);
+        // The placement the app asked for, captured before the rebuild clears the
+        // surface it was shown in.
+        let placement = self.placement;
         let visual = unsafe { composition.comp_device().CreateVisual() }?;
         let opacity_visual: IDCompositionVisual3 = visual.cast()?;
         let root_visual = composition.root_visual().clone();
@@ -259,8 +279,7 @@ impl CompositorOverlay {
             visual.SetContent(None::<&windows::core::IUnknown>)?;
             root_visual.AddVisual(&visual, true, None)?;
         }
-        let (width, height) = shown_size(&self.content, placed);
-        if width > 0 && height > 0 {
+        if let Some((width, height)) = rebuilt_size(&self.content, placement) {
             self.recreate_surface(width, height)?;
         }
         self.apply_position()?;
@@ -414,22 +433,27 @@ impl CompositorOverlay {
         Ok(())
     }
 
-    /// Place the overlay at `x`,`y` in the size the remembered content is shown
-    /// at, recreating the surface when it does not already have that size.
+    /// Place the overlay at `x`,`y`, remembering the size the app asked for.
     ///
-    /// The position always applies. The size only applies where the content can
-    /// fill it: a placement an image does not fill leaves the surface — and the
+    /// The position always applies, and it is applied even when the surface
+    /// cannot be recreated: a caller caches the geometry it asked for and would
+    /// never re-issue a lost move. The size applies where the content can fill
+    /// it: a placement an image does not fill leaves the surface — and the
     /// complete image in it — alone, rather than resizing it onto content that
-    /// cannot cover it. The image for the new size arrives in the same update and
-    /// resizes the surface itself.
+    /// cannot cover it, and the image for that size resizes the surface when the
+    /// app uploads it.
     fn set_geometry_impl(&mut self, x: f32, y: f32, width: u32, height: u32) -> Result<()> {
         self.x = x;
         self.y = y;
-        let (shown_width, shown_height) = shown_size(&self.content, (width, height));
-        if (self.width, self.height) != (shown_width, shown_height) {
-            self.recreate_surface(shown_width, shown_height)?;
-        }
-        self.apply_position()
+        self.placement = (width, height);
+        let (shown_width, shown_height) = shown_size(&self.content, self.placement);
+        let resized = if (self.width, self.height) != (shown_width, shown_height) {
+            self.recreate_surface(shown_width, shown_height)
+        } else {
+            Ok(())
+        };
+        let moved = self.apply_position();
+        resized.and(moved)
     }
 
     /// Move the visual to the overlay's committed position and commit.
@@ -445,7 +469,15 @@ impl CompositorOverlay {
     fn set_color_impl(&mut self, color: [f32; 4]) -> Result<()> {
         self.content = Content::Solid(color);
         if let Some(surface) = self.surface.clone() {
-            self.fill_surface(&surface, self.width, self.height)?;
+            // A solid color fills any size, so it is shown at the size the app last
+            // asked for — including a placement an image could not fill and could
+            // not grow the surface to.
+            let (width, height) = shown_size(&self.content, self.placement);
+            if (width, height) == (self.width, self.height) {
+                self.fill_surface(&surface, width, height)?;
+            } else {
+                self.recreate_surface(width, height)?;
+            }
         }
         self.commit()
     }
@@ -464,8 +496,10 @@ impl CompositorOverlay {
             // resizes the surface with it — in one operation, drawn before it is
             // attached, which is what lets a placement that asked for the new size
             // and the image that fills it arrive in either order without a surface
-            // holding content that does not cover it.
-            let (shown_width, shown_height) = shown_size(&self.content, (self.width, self.height));
+            // holding content that does not cover it. The placement is left alone:
+            // it is the size the app asked for, and a solid color that replaces
+            // this image is placed at it.
+            let (shown_width, shown_height) = shown_size(&self.content, self.placement);
             if (shown_width, shown_height) != (self.width, self.height) {
                 self.recreate_surface(shown_width, shown_height)?;
             } else {
@@ -677,8 +711,8 @@ impl PlatformCompositorOverlay for CompositorOverlay {
 #[cfg(test)]
 mod tests {
     use super::{
-        Content, content_pixels, destination_box, shown_size, validate_destination, validate_rgba,
-        validate_rgba_fits,
+        Content, content_pixels, destination_box, rebuilt_size, shown_size, validate_destination,
+        validate_rgba, validate_rgba_fits,
     };
     use windows::Win32::Foundation::POINT;
 
@@ -875,13 +909,50 @@ mod tests {
     /// a solid color. A surface the lost device had is never reused.
     #[test]
     fn a_rebuild_restores_the_remembered_content_at_the_size_it_is_shown_at() {
-        assert_eq!(shown_size(&image(30, 30), (30, 30)), (30, 30), "an image");
-        let solid = Content::Solid([0.2, 0.4, 0.6, 1.0]);
-        assert_eq!(shown_size(&solid, (30, 30)), (30, 30), "a solid color");
         assert_eq!(
-            shown_size(&solid, (0, 0)),
-            (0, 0),
-            "an overlay that was never placed has no surface to rebuild"
+            rebuilt_size(&image(30, 30), (30, 30)),
+            Some((30, 30)),
+            "an image"
+        );
+        let solid = Content::Solid([0.2, 0.4, 0.6, 1.0]);
+        assert_eq!(
+            rebuilt_size(&solid, (30, 30)),
+            Some((30, 30)),
+            "a solid color"
+        );
+        assert_eq!(
+            rebuilt_size(&image(24, 24), (0, 0)),
+            None,
+            "an overlay that was never placed has no surface to rebuild, whatever \
+             content it remembers"
+        );
+        assert_eq!(
+            rebuilt_size(&solid, (0, 0)),
+            None,
+            "and neither has a solid one"
+        );
+    }
+
+    /// A placement an image cannot fill is remembered, not lost: the image is
+    /// shown at its own size, and the size the app asked for is still there for
+    /// the content that can fill it.
+    #[test]
+    fn a_placement_outlives_an_image_the_placement_could_not_hold() {
+        let placement = (30, 30);
+        assert_eq!(
+            shown_size(&image(24, 24), placement),
+            (24, 24),
+            "the image on screen is shown at its own size"
+        );
+        assert_eq!(
+            rebuilt_size(&image(24, 24), placement),
+            Some((24, 24)),
+            "and a rebuild restores that image"
+        );
+        assert_eq!(
+            rebuilt_size(&Content::Solid([0.2, 0.4, 0.6, 1.0]), placement),
+            Some((30, 30)),
+            "while a solid color comes back at the size the app asked for"
         );
     }
 }
