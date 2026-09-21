@@ -19,7 +19,9 @@ use windows::core::Interface;
 use windows::{
     Win32::Foundation::{POINT, RECT},
     Win32::Graphics::{
-        Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D},
+        Direct3D11::{
+            D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
+        },
         DirectComposition::{
             IDCompositionDevice, IDCompositionSurface, IDCompositionVisual, IDCompositionVisual3,
         },
@@ -289,18 +291,31 @@ impl CompositorOverlay {
             right: width as i32,
             bottom: height as i32,
         };
+        // `BeginDraw` returns an update surface that is generally a sub-rectangle
+        // of the composition surface, located at this returned origin. Even when
+        // the whole logical surface is requested the origin is not promised to be
+        // `(0, 0)`, so the content has to be written at it rather than assumed to
+        // start at the update surface's own origin.
         let mut offset = POINT::default();
         let update: IDXGISurface1 = unsafe { surface.BeginDraw(Some(&rect), &mut offset)? };
-        let drawn = self.draw_content(&update);
+        let drawn = self.draw_content(&update, offset);
         let ended: Result<()> = unsafe { surface.EndDraw() }.map_err(Into::into);
         drawn.and(ended)
     }
 
-    /// Draw the remembered content into the surface `BeginDraw` opened.
-    fn draw_content(&self, update: &IDXGISurface1) -> Result<()> {
+    /// Draw the remembered content into the surface `BeginDraw` opened, at the
+    /// `offset` that call reported.
+    fn draw_content(&self, update: &IDXGISurface1, offset: POINT) -> Result<()> {
         let texture: ID3D11Texture2D = update.cast()?;
         match &self.content {
             Content::Solid(color) => {
+                // A solid fill covers the whole update target, so its destination
+                // *is* the update surface as a whole and needs no origin. That is
+                // the same `BeginDraw` contract the RGBA path honors explicitly:
+                // here the update surface itself is the region being written, and
+                // clearing its render target fills every pixel of it. Deriving the
+                // view from the update texture is what keeps that true — an origin
+                // is never assumed, it is simply the whole target.
                 let mut render_target_view: Option<ID3D11RenderTargetView> = None;
                 unsafe {
                     self.device.CreateRenderTargetView(
@@ -318,7 +333,11 @@ impl CompositorOverlay {
                 };
                 Ok(())
             }
-            Content::Rgba { width, pixels, .. } => {
+            Content::Rgba {
+                width,
+                height,
+                pixels,
+            } => {
                 // The composition surface is B8G8R8A8 while this trait is
                 // explicitly RGBA, so this one platform boundary swaps red and
                 // blue and nothing above it knows the surface's format.
@@ -326,11 +345,15 @@ impl CompositorOverlay {
                 for pixel in bgra.chunks_exact_mut(4) {
                     pixel.swap(0, 2);
                 }
+                let (update_width, update_height) = surface_dimensions(update)?;
+                let destination = destination_box(*width, *height, offset)
+                    .context("compositor update offset is outside the update surface")?;
+                validate_destination(&destination, update_width, update_height)?;
                 unsafe {
                     self.device_context.UpdateSubresource(
                         &texture,
                         0,
-                        None,
+                        Some(&destination),
                         bgra.as_ptr() as _,
                         width * 4,
                         0,
@@ -514,6 +537,52 @@ fn validate_rgba_fits(
     Ok(())
 }
 
+/// The destination box for content of `width`x`height` written at the origin
+/// `BeginDraw` reported for this update.
+///
+/// Returns `None` when that origin cannot be expressed as a D3D11 box: an
+/// update offset is a signed pixel coordinate, so a negative origin has no
+/// destination inside the update surface and is a caller-visible failure
+/// rather than something to wrap into the wrong place.
+fn destination_box(width: u32, height: u32, offset: POINT) -> Option<D3D11_BOX> {
+    let left = u32::try_from(offset.x).ok()?;
+    let top = u32::try_from(offset.y).ok()?;
+    let right = left.checked_add(width)?;
+    let bottom = top.checked_add(height)?;
+    Some(D3D11_BOX {
+        left,
+        top,
+        front: 0,
+        right,
+        bottom,
+        back: 1,
+    })
+}
+
+/// Reject a destination box that leaves the update surface. A box that does not
+/// fit would be silently clipped by D3D11, drawing a cropped image at a wrong
+/// scale instead of failing loudly.
+fn validate_destination(
+    destination: &D3D11_BOX,
+    update_width: u32,
+    update_height: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        destination.right <= update_width && destination.bottom <= update_height,
+        "compositor update destination {}x{} leaves the {update_width}x{update_height} update surface",
+        destination.right,
+        destination.bottom
+    );
+    Ok(())
+}
+
+/// The pixel size of the update surface `BeginDraw` returned, which bounds the
+/// destination the content may be written to.
+fn surface_dimensions(update: &IDXGISurface1) -> Result<(u32, u32)> {
+    let description = unsafe { update.GetDesc()? };
+    Ok((description.Width, description.Height))
+}
+
 impl PlatformCompositorOverlay for CompositorOverlay {
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32) {
         if let Err(error) = self.set_geometry_impl(x, y, width, height) {
@@ -554,7 +623,8 @@ impl PlatformCompositorOverlay for CompositorOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_rgba, validate_rgba_fits};
+    use super::{destination_box, validate_destination, validate_rgba, validate_rgba_fits};
+    use windows::Win32::Foundation::POINT;
 
     #[test]
     fn rgba_content_must_be_a_complete_nonzero_buffer() {
@@ -577,5 +647,71 @@ mod tests {
             "narrow surface"
         );
         assert!(validate_rgba_fits(22, 22, 22, 21).is_err(), "short surface");
+    }
+
+    /// The update surface's returned origin is where the content must be
+    /// written; zero is only one of the origins `BeginDraw` may report.
+    #[test]
+    fn content_destination_starts_at_the_reported_update_offset() {
+        let zero = destination_box(8, 4, POINT { x: 0, y: 0 }).expect("zero offset");
+        assert_eq!((zero.left, zero.top, zero.right, zero.bottom), (0, 0, 8, 4));
+        assert_eq!((zero.front, zero.back), (0, 1), "one depth slice");
+
+        let shifted_x = destination_box(8, 4, POINT { x: 3, y: 0 }).expect("positive x");
+        assert_eq!(
+            (
+                shifted_x.left,
+                shifted_x.top,
+                shifted_x.right,
+                shifted_x.bottom
+            ),
+            (3, 0, 11, 4)
+        );
+
+        let shifted_y = destination_box(8, 4, POINT { x: 0, y: 5 }).expect("positive y");
+        assert_eq!(
+            (
+                shifted_y.left,
+                shifted_y.top,
+                shifted_y.right,
+                shifted_y.bottom
+            ),
+            (0, 5, 8, 9)
+        );
+
+        let shifted = destination_box(8, 4, POINT { x: 2, y: 5 }).expect("x and y");
+        assert_eq!(
+            (shifted.left, shifted.top, shifted.right, shifted.bottom),
+            (2, 5, 10, 9),
+            "an offset moves the destination in both axes"
+        );
+    }
+
+    #[test]
+    fn a_negative_update_offset_has_no_destination() {
+        assert!(destination_box(8, 4, POINT { x: -1, y: 0 }).is_none());
+        assert!(destination_box(8, 4, POINT { x: 0, y: -1 }).is_none());
+    }
+
+    #[test]
+    fn an_origin_that_would_overflow_has_no_destination() {
+        assert!(destination_box(u32::MAX, 1, POINT { x: 1, y: 0 }).is_none());
+        assert!(destination_box(1, u32::MAX, POINT { x: 0, y: 1 }).is_none());
+    }
+
+    /// A destination that does not fit is rejected instead of being silently
+    /// clipped into a cropped draw at the wrong place.
+    #[test]
+    fn a_destination_must_stay_inside_the_update_surface() {
+        let fits = destination_box(8, 4, POINT { x: 2, y: 1 }).expect("offset");
+        assert!(validate_destination(&fits, 10, 5).is_ok(), "exactly fits");
+        assert!(
+            validate_destination(&fits, 9, 5).is_err(),
+            "overflows width"
+        );
+        assert!(
+            validate_destination(&fits, 10, 4).is_err(),
+            "overflows height"
+        );
     }
 }
