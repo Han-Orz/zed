@@ -19,9 +19,7 @@ use windows::core::Interface;
 use windows::{
     Win32::Foundation::{POINT, RECT},
     Win32::Graphics::{
-        Direct3D11::{
-            D3D11_BOX, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
-        },
+        Direct3D11::{D3D11_BOX, ID3D11DeviceContext, ID3D11Texture2D},
         DirectComposition::{
             IDCompositionDevice, IDCompositionSurface, IDCompositionVisual, IDCompositionVisual3,
         },
@@ -36,7 +34,6 @@ use crate::directx_renderer::{DirectComposition, DirectXRendererDevices};
 
 pub(crate) struct CompositorOverlay {
     comp_device: IDCompositionDevice,
-    device: ID3D11Device,
     device_context: ID3D11DeviceContext,
 
     /// The composition root `visual` is attached to. Held so the overlay can
@@ -146,6 +143,36 @@ fn smoothstep(u: f64) -> f32 {
     (u * u * (3.0 - 2.0 * u)) as f32
 }
 
+/// One color channel scaled by alpha and quantized to 8 bits, which is the
+/// premultiplied form the composition surface stores.
+fn premultiplied_channel(channel: f32, alpha: f32) -> u8 {
+    (channel * alpha * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// The content as premultiplied RGBA8 covering `width`x`height`.
+///
+/// A solid color expands to a buffer of that size, which is what lets both
+/// content kinds reach the surface through one region-limited upload.
+fn content_pixels(content: &Content, width: u32, height: u32) -> Vec<u8> {
+    match content {
+        Content::Solid(color) => {
+            let [r, g, b, a] = *color;
+            let pixel = [
+                premultiplied_channel(r, a),
+                premultiplied_channel(g, a),
+                premultiplied_channel(b, a),
+                (a * 255.0).round().clamp(0.0, 255.0) as u8,
+            ];
+            let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+            for _ in 0..(width as usize * height as usize) {
+                pixels.extend_from_slice(&pixel);
+            }
+            pixels
+        }
+        Content::Rgba { pixels, .. } => pixels.clone(),
+    }
+}
+
 impl CompositorOverlay {
     /// Create the overlay visual as the topmost child of the composition
     /// root. It starts hidden and contentless until the app places it.
@@ -168,7 +195,6 @@ impl CompositorOverlay {
 
         Ok(Rc::new(RefCell::new(Self {
             comp_device,
-            device: devices.device.clone(),
             device_context: devices.device_context.clone(),
             root_visual,
             opacity_visual,
@@ -200,7 +226,6 @@ impl CompositorOverlay {
         // best effort against a root that is already gone.
         self.detach_visual();
         self.comp_device = composition.comp_device().clone();
-        self.device = devices.device.clone();
         self.device_context = devices.device_context.clone();
         self.root_visual = root_visual.clone();
         self.visual = visual.clone();
@@ -298,70 +323,58 @@ impl CompositorOverlay {
         // start at the update surface's own origin.
         let mut offset = POINT::default();
         let update: IDXGISurface1 = unsafe { surface.BeginDraw(Some(&rect), &mut offset)? };
-        let drawn = self.draw_content(&update, offset);
+        let drawn = self.draw_content(&update, offset, width, height);
         let ended: Result<()> = unsafe { surface.EndDraw() }.map_err(Into::into);
         drawn.and(ended)
     }
 
     /// Draw the remembered content into the surface `BeginDraw` opened, at the
-    /// `offset` that call reported.
-    fn draw_content(&self, update: &IDXGISurface1, offset: POINT) -> Result<()> {
+    /// `offset` that call reported for this update region.
+    ///
+    /// Both content kinds reach the surface the same way: one tightly packed
+    /// premultiplied image written into the region `BeginDraw` allocated. A
+    /// solid color is rasterized into that image rather than cleared through a
+    /// render target view, because a clear covers the whole texture while the
+    /// update surface is generally a sub-rectangle of the composition surface —
+    /// clearing it would write pixels outside the requested region.
+    fn draw_content(
+        &self,
+        update: &IDXGISurface1,
+        offset: POINT,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
         let texture: ID3D11Texture2D = update.cast()?;
-        match &self.content {
-            Content::Solid(color) => {
-                // A solid fill covers the whole update target, so its destination
-                // *is* the update surface as a whole and needs no origin. That is
-                // the same `BeginDraw` contract the RGBA path honors explicitly:
-                // here the update surface itself is the region being written, and
-                // clearing its render target fills every pixel of it. Deriving the
-                // view from the update texture is what keeps that true — an origin
-                // is never assumed, it is simply the whole target.
-                let mut render_target_view: Option<ID3D11RenderTargetView> = None;
-                unsafe {
-                    self.device.CreateRenderTargetView(
-                        &texture,
-                        None,
-                        Some(&mut render_target_view),
-                    )?
-                };
-                let render_target_view = render_target_view.context("no render target view")?;
-                let [r, g, b, a] = *color;
-                // Premultiplied alpha: the surface's alpha mode is premultiplied.
-                unsafe {
-                    self.device_context
-                        .ClearRenderTargetView(&render_target_view, &[r * a, g * a, b * a, a])
-                };
-                Ok(())
-            }
-            Content::Rgba {
-                width,
-                height,
-                pixels,
-            } => {
-                // The composition surface is B8G8R8A8 while this trait is
-                // explicitly RGBA, so this one platform boundary swaps red and
-                // blue and nothing above it knows the surface's format.
-                let mut bgra = pixels.to_vec();
-                for pixel in bgra.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-                let (update_width, update_height) = surface_dimensions(update)?;
-                let destination = destination_box(*width, *height, offset)
-                    .context("compositor update offset is outside the update surface")?;
-                validate_destination(&destination, update_width, update_height)?;
-                unsafe {
-                    self.device_context.UpdateSubresource(
-                        &texture,
-                        0,
-                        Some(&destination),
-                        bgra.as_ptr() as _,
-                        width * 4,
-                        0,
-                    );
-                }
-                Ok(())
-            }
+        // The composition surface is B8G8R8A8 while this trait is explicitly
+        // RGBA, so this one platform boundary swaps red and blue and nothing
+        // above it knows the surface's format.
+        let mut bgra = self.content_pixels(width, height);
+        for pixel in bgra.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
         }
+        let (update_width, update_height) = surface_dimensions(update)?;
+        let destination = destination_box(width, height, offset)
+            .context("compositor update offset is outside the update surface")?;
+        validate_destination(&destination, update_width, update_height)?;
+        unsafe {
+            self.device_context.UpdateSubresource(
+                &texture,
+                0,
+                Some(&destination),
+                bgra.as_ptr() as _,
+                width * 4,
+                0,
+            );
+        }
+        Ok(())
+    }
+
+    /// The remembered content as premultiplied RGBA8 covering `width`x`height`.
+    ///
+    /// A solid color expands to a buffer of that size, which is what lets both
+    /// content kinds use the same region-limited upload.
+    fn content_pixels(&self, width: u32, height: u32) -> Vec<u8> {
+        content_pixels(&self.content, width, height)
     }
 
     fn recreate_surface(&mut self, width: u32, height: u32) -> Result<()> {
@@ -623,7 +636,10 @@ impl PlatformCompositorOverlay for CompositorOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::{destination_box, validate_destination, validate_rgba, validate_rgba_fits};
+    use super::{
+        Content, content_pixels, destination_box, validate_destination, validate_rgba,
+        validate_rgba_fits,
+    };
     use windows::Win32::Foundation::POINT;
 
     #[test]
@@ -713,5 +729,35 @@ mod tests {
             validate_destination(&fits, 10, 4).is_err(),
             "overflows height"
         );
+    }
+
+    /// A solid color becomes a premultiplied image covering exactly the
+    /// requested region, so it reaches the surface through the same
+    /// region-limited upload as an image instead of clearing a whole render
+    /// target that may extend past the update rectangle.
+    #[test]
+    fn a_solid_color_rasterizes_to_a_premultiplied_image() {
+        let overlay = Content::Solid([0.2, 0.4, 0.6, 0.5]);
+        let pixels = content_pixels(&overlay, 2, 2);
+        assert_eq!(pixels.len(), 16, "2x2 premultiplied RGBA");
+        // Premultiplied: each channel scaled by alpha 0.5.
+        assert_eq!(&pixels[0..4], &[26, 51, 77, 128]);
+        assert!(
+            pixels.chunks_exact(4).all(|pixel| pixel == &pixels[0..4]),
+            "every pixel of a solid fill is the same"
+        );
+    }
+
+    /// The image kind keeps its own pixels; only the byte order is swapped at
+    /// the surface boundary, never inside this buffer.
+    #[test]
+    fn an_image_keeps_its_pixels() {
+        let source = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let content = Content::Rgba {
+            width: 2,
+            height: 1,
+            pixels: source.clone(),
+        };
+        assert_eq!(content_pixels(&content, 2, 1), source);
     }
 }
