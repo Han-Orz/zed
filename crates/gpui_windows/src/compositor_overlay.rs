@@ -36,6 +36,7 @@ pub(crate) struct CompositorOverlay {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
 
+    root_visual: IDCompositionVisual,
     visual: IDCompositionVisual,
     /// The same visual as `visual`, typed for opacity control (Windows 10+).
     opacity_visual: IDCompositionVisual3,
@@ -46,10 +47,20 @@ pub(crate) struct CompositorOverlay {
     width: u32,
     height: u32,
     color: [f32; 4],
+    content: Content,
     /// What the compositor was last told to play. It is also the overlay's
     /// remembered opacity: a rebuild restores the value this motion holds or
     /// is passing through, so the overlay never comes back at a stale one.
     motion: Motion,
+}
+
+enum Content {
+    Solid([f32; 4]),
+    Rgba {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
 }
 
 /// What the compositor is playing on the overlay's opacity. DirectComposition
@@ -136,9 +147,10 @@ impl CompositorOverlay {
         let comp_device = composition.comp_device().clone();
         let visual = unsafe { comp_device.CreateVisual() }?;
         let opacity_visual: IDCompositionVisual3 = visual.cast()?;
+        let root_visual = composition.root_visual().clone();
         unsafe {
             visual.SetContent(None::<&windows::core::IUnknown>)?;
-            composition.root_visual().AddVisual(&visual, true, None)?;
+            root_visual.AddVisual(&visual, true, None)?;
             visual.SetOffsetX2(0.0)?;
             visual.SetOffsetY2(0.0)?;
             opacity_visual.SetOpacity2(0.0)?;
@@ -149,6 +161,7 @@ impl CompositorOverlay {
             comp_device,
             device: devices.device.clone(),
             device_context: devices.device_context.clone(),
+            root_visual,
             opacity_visual,
             visual,
             surface: None,
@@ -157,6 +170,7 @@ impl CompositorOverlay {
             width: 0,
             height: 0,
             color: [0.0, 0.0, 0.0, 1.0],
+            content: Content::Solid([0.0, 0.0, 0.0, 1.0]),
             // Created invisible: the app's first fade brings it in.
             motion: Motion::Hold(0.0),
         })))
@@ -173,9 +187,12 @@ impl CompositorOverlay {
         let (x, y, width, height) = (self.x, self.y, self.width, self.height);
         let visual = unsafe { composition.comp_device().CreateVisual() }?;
         let opacity_visual: IDCompositionVisual3 = visual.cast()?;
+        let root_visual = composition.root_visual().clone();
+        self.detach_visual();
         self.comp_device = composition.comp_device().clone();
         self.device = devices.device.clone();
         self.device_context = devices.device_context.clone();
+        self.root_visual = root_visual.clone();
         self.visual = visual.clone();
         self.opacity_visual = opacity_visual;
         // The content surface belonged to the lost device; the geometry the app
@@ -187,7 +204,7 @@ impl CompositorOverlay {
         self.height = 0;
         unsafe {
             visual.SetContent(None::<&windows::core::IUnknown>)?;
-            composition.root_visual().AddVisual(&visual, true, None)?;
+            root_visual.AddVisual(&visual, true, None)?;
         }
         if width > 0 && height > 0 {
             self.set_geometry_impl(x, y, width, height)?;
@@ -229,35 +246,78 @@ impl CompositorOverlay {
         Ok(())
     }
 
-    /// Draw the solid content color into the composition surface.
-    fn fill_surface(
-        &self,
-        surface: &IDCompositionSurface,
-        width: u32,
-        height: u32,
-        color: [f32; 4],
-    ) -> Result<()> {
+    fn detach_visual(&self) {
+        let result = unsafe {
+            self.root_visual
+                .RemoveVisual(&self.visual)
+                .and_then(|_| self.comp_device.Commit())
+        };
+        if let Err(error) = result {
+            log::debug!("compositor overlay detach skipped: {error}");
+        }
+    }
+
+    /// Draw the remembered content into the composition surface.
+    fn fill_surface(&self, surface: &IDCompositionSurface, width: u32, height: u32) -> Result<()> {
         let rect = RECT {
             left: 0,
             top: 0,
             right: width as i32,
             bottom: height as i32,
         };
-        let mut offset = POINT::default();
-        let update: IDXGISurface1 = unsafe { surface.BeginDraw(Some(&rect), &mut offset)? };
+        let mut _offset = POINT::default();
+        let update: IDXGISurface1 = unsafe { surface.BeginDraw(Some(&rect), &mut _offset)? };
         let texture: ID3D11Texture2D = update.cast()?;
-        let mut render_target_view: Option<ID3D11RenderTargetView> = None;
-        unsafe {
-            self.device
-                .CreateRenderTargetView(&texture, None, Some(&mut render_target_view))?
-        };
-        let render_target_view = render_target_view.context("no render target view")?;
-        let [r, g, b, a] = color;
-        // Premultiplied alpha: the surface's alpha mode is premultiplied.
-        unsafe {
-            self.device_context
-                .ClearRenderTargetView(&render_target_view, &[r * a, g * a, b * a, a])
-        };
+        match &self.content {
+            Content::Solid(color) => {
+                let mut render_target_view: Option<ID3D11RenderTargetView> = None;
+                unsafe {
+                    self.device.CreateRenderTargetView(
+                        &texture,
+                        None,
+                        Some(&mut render_target_view),
+                    )?
+                };
+                let render_target_view = render_target_view.context("no render target view")?;
+                let [r, g, b, a] = *color;
+                // Premultiplied alpha: the surface's alpha mode is premultiplied.
+                unsafe {
+                    self.device_context
+                        .ClearRenderTargetView(&render_target_view, &[r * a, g * a, b * a, a])
+                };
+            }
+            Content::Rgba {
+                width: content_width,
+                height: content_height,
+                pixels,
+            } => {
+                validate_rgba_content(*content_width, *content_height, pixels)?;
+                anyhow::ensure!(
+                    *content_width == width && *content_height == height,
+                    "RGBA content is {}x{}, but the surface is {}x{}",
+                    content_width,
+                    content_height,
+                    width,
+                    height
+                );
+                // DirectComposition's surface is B8G8R8A8. The generic API is
+                // explicit RGBA, so only this tiny platform boundary swaps R/B.
+                let mut bgra = Vec::with_capacity(pixels.len());
+                for pixel in pixels.chunks_exact(4) {
+                    bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+                unsafe {
+                    self.device_context.UpdateSubresource(
+                        &texture,
+                        0,
+                        None,
+                        bgra.as_ptr() as _,
+                        width * 4,
+                        0,
+                    );
+                }
+            }
+        }
         unsafe { surface.EndDraw()? };
         Ok(())
     }
@@ -271,7 +331,7 @@ impl CompositorOverlay {
                 DXGI_ALPHA_MODE_PREMULTIPLIED,
             )?
         };
-        self.fill_surface(&surface, width, height, self.color)?;
+        self.fill_surface(&surface, width, height)?;
         unsafe { self.visual.SetContent(&surface)? };
         self.surface = Some(surface);
         self.width = width;
@@ -294,8 +354,26 @@ impl CompositorOverlay {
 
     fn set_color_impl(&mut self, color: [f32; 4]) -> Result<()> {
         self.color = color;
+        self.content = Content::Solid(color);
         if let Some(surface) = self.surface.clone() {
-            self.fill_surface(&surface, self.width, self.height, self.color)?;
+            self.fill_surface(&surface, self.width, self.height)?;
+        }
+        self.commit()
+    }
+
+    fn set_content_rgba_impl(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+        validate_rgba_content(width, height, pixels)?;
+        self.content = Content::Rgba {
+            width,
+            height,
+            pixels: pixels.to_vec(),
+        };
+        if let Some(surface) = self.surface.clone() {
+            if self.width != width || self.height != height {
+                self.recreate_surface(width, height)?;
+            } else {
+                self.fill_surface(&surface, width, height)?;
+            }
         }
         self.commit()
     }
@@ -374,10 +452,40 @@ impl CompositorOverlay {
     }
 }
 
+impl Drop for CompositorOverlay {
+    fn drop(&mut self) {
+        self.detach_visual();
+    }
+}
+
+fn validate_rgba_content(width: u32, height: u32, pixels: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "RGBA content dimensions must be non-zero"
+    );
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("RGBA content dimensions overflow")?;
+    anyhow::ensure!(
+        pixels.len() == expected,
+        "RGBA content has {} bytes, expected {}",
+        pixels.len(),
+        expected
+    );
+    Ok(())
+}
+
 impl PlatformCompositorOverlay for CompositorOverlay {
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32) {
         if let Err(error) = self.set_geometry_impl(x, y, width, height) {
             log::error!("compositor overlay set_geometry failed: {error}");
+        }
+    }
+
+    fn set_content_rgba(&mut self, width: u32, height: u32, pixels: &[u8]) {
+        if let Err(error) = self.set_content_rgba_impl(width, height, pixels) {
+            log::error!("compositor overlay set_content_rgba failed: {error}");
         }
     }
 
@@ -403,5 +511,18 @@ impl PlatformCompositorOverlay for CompositorOverlay {
         if let Err(error) = self.hold_impl(opacity) {
             log::error!("compositor overlay hold_opacity failed: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_rgba_content;
+
+    #[test]
+    fn rgba_content_requires_exact_nonzero_buffer() {
+        assert!(validate_rgba_content(1, 1, &[0; 4]).is_ok());
+        assert!(validate_rgba_content(1, 1, &[0; 3]).is_err());
+        assert!(validate_rgba_content(0, 1, &[]).is_err());
+        assert!(validate_rgba_content(u32::MAX, u32::MAX, &[]).is_err());
     }
 }

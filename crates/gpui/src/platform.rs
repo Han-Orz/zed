@@ -917,6 +917,9 @@ pub trait PlatformCompositorOverlay {
     /// animation land between two pixels. The size is whole physical pixels
     /// because it is the raster size of the overlay's content.
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32);
+    /// Replace the overlay's content with tightly packed premultiplied RGBA8
+    /// pixels. `pixels` must contain exactly `width * height * 4` bytes.
+    fn set_content_rgba(&mut self, width: u32, height: u32, pixels: &[u8]);
     /// Fill the overlay with a solid non-premultiplied color.
     fn set_color(&mut self, color: [f32; 4]);
     /// Move the overlay to `target` opacity over `duration_s` seconds, from
@@ -1022,10 +1025,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn present_count(&self) -> u64 {
         0
     }
-    /// The window's compositor overlay visual, when the platform supports
-    /// one. Returns the same handle for every call on a window.
+    /// Create an independent compositor overlay visual when the platform
+    /// supports one. Each call returns a new handle owned by the caller.
     #[cfg(target_os = "windows")]
-    fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
+    fn create_compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
         None
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

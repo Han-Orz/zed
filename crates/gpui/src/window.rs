@@ -2793,15 +2793,15 @@ impl Window {
         self.platform_window.present_count()
     }
 
-    /// The window's compositor overlay visual, when the platform supports
-    /// one. The overlay is presentation-only platform content the compositor
-    /// can position and animate without the app rendering a frame; it never
-    /// receives input and never touches the window's scene.
+    /// Creates an independent compositor overlay visual when the platform
+    /// supports one. The overlay is presentation-only platform content the
+    /// compositor can position and animate without the app rendering a frame;
+    /// it never receives input and never touches the window's scene.
     #[cfg(target_os = "windows")]
-    pub fn compositor_overlay(
+    pub fn create_compositor_overlay(
         &self,
     ) -> Option<Rc<RefCell<dyn crate::platform::PlatformCompositorOverlay>>> {
-        self.platform_window.compositor_overlay()
+        self.platform_window.create_compositor_overlay()
     }
 
     /// Returns whether this window is considered to be the window

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    rc::Rc,
+    rc::{Rc, Weak},
     slice,
     sync::{Arc, OnceLock},
 };
@@ -46,7 +46,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
-    overlay: Option<Rc<RefCell<CompositorOverlay>>>,
+    overlays: Vec<Weak<RefCell<CompositorOverlay>>>,
     #[cfg(feature = "diagnostics")]
     present_count: u64,
     font_info: &'static FontInfo,
@@ -195,7 +195,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
-            overlay: None,
+            overlays: Vec::new(),
             #[cfg(feature = "diagnostics")]
             present_count: 0,
             font_info: Self::get_font_info(),
@@ -209,23 +209,22 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    /// The window's compositor overlay visual, created lazily on first use.
-    /// Returns `None` when DirectComposition is unavailable.
-    pub(crate) fn compositor_overlay(
+    /// Creates an independent compositor overlay visual.
+    /// Returns `None` when DirectComposition is unavailable or creation fails.
+    pub(crate) fn create_compositor_overlay(
         &mut self,
     ) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
         let devices = self.devices.as_ref()?;
         let composition = self.direct_composition.as_ref()?;
-        if self.overlay.is_none() {
-            match CompositorOverlay::new(devices, composition) {
-                Ok(overlay) => self.overlay = Some(overlay),
-                Err(error) => {
-                    log::error!("Creating compositor overlay failed: {error}");
-                    return None;
-                }
+        self.overlays.retain(|overlay| overlay.upgrade().is_some());
+        let overlay = match CompositorOverlay::new(devices, composition) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                log::error!("Creating compositor overlay failed: {error}");
+                return None;
             }
-        }
-        let overlay = self.overlay.clone()?;
+        };
+        self.overlays.push(Rc::downgrade(&overlay));
         let overlay: Rc<RefCell<dyn PlatformCompositorOverlay>> = overlay;
         Some(overlay)
     }
@@ -350,16 +349,22 @@ impl DirectXRenderer {
             Some(composition)
         };
 
-        if let Some(overlay) = &self.overlay
-            && let Some(composition) = direct_composition.as_ref()
-        {
-            if let Err(error) = overlay
-                .borrow_mut()
-                .rebuild(&devices, composition)
-                .context("Rebuilding compositor overlay")
-            {
-                log::error!("{error:#}");
-            }
+        if let Some(composition) = direct_composition.as_ref() {
+            self.overlays.retain(|overlay| {
+                let Some(overlay) = overlay.upgrade() else {
+                    return false;
+                };
+                if let Err(error) = overlay
+                    .borrow_mut()
+                    .rebuild(&devices, composition)
+                    .context("Rebuilding compositor overlay")
+                {
+                    log::error!("{error:#}");
+                }
+                true
+            });
+        } else {
+            self.overlays.retain(|overlay| overlay.upgrade().is_some());
         }
 
         self.atlas
@@ -1411,6 +1416,24 @@ fn create_swap_chain(
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
     unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }?;
     Ok(swap_chain)
+}
+
+#[cfg(test)]
+mod compositor_overlay_handle_tests {
+    use std::rc::Rc;
+
+    #[test]
+    fn dropped_handles_are_removed_from_the_weak_collection() {
+        let live = Rc::new(());
+        let dropped = Rc::new(());
+        let mut handles = vec![Rc::downgrade(&live), Rc::downgrade(&dropped)];
+        drop(dropped);
+
+        handles.retain(|handle| handle.upgrade().is_some());
+
+        assert_eq!(handles.len(), 1);
+        assert!(handles[0].upgrade().is_some());
+    }
 }
 
 #[inline]
