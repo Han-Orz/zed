@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    rc::Rc,
+    rc::{Rc, Weak},
     slice,
     sync::{Arc, OnceLock},
 };
@@ -46,7 +46,11 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
-    overlay: Option<Rc<RefCell<CompositorOverlay>>>,
+    /// The compositor overlays this window has handed out. The renderer never
+    /// owns a visual: the app's handle is the ownership, and these weak
+    /// references exist only so a device-loss rebuild can reach the overlays
+    /// that are still alive.
+    overlays: Vec<Weak<RefCell<CompositorOverlay>>>,
     #[cfg(feature = "diagnostics")]
     present_count: u64,
     font_info: &'static FontInfo,
@@ -126,6 +130,22 @@ pub(crate) struct DirectComposition {
     comp_visual: IDCompositionVisual,
 }
 
+/// Visit every handle whose owner is still alive, dropping the references to
+/// the ones that are gone.
+///
+/// A visit cannot remove a handle: a live overlay stays remembered whether or
+/// not its visit succeeded, so a failed device-loss rebuild keeps a visual the
+/// app still holds for the next attempt instead of silently discarding it.
+fn retain_live_handles<T>(handles: &mut Vec<Weak<T>>, mut visit: impl FnMut(&Rc<T>)) {
+    handles.retain(|handle| {
+        let Some(handle) = handle.upgrade() else {
+            return false;
+        };
+        visit(&handle);
+        true
+    });
+}
+
 impl DirectXRendererDevices {
     pub(crate) fn new(
         directx_devices: &DirectXDevices,
@@ -195,7 +215,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
-            overlay: None,
+            overlays: Vec::new(),
             #[cfg(feature = "diagnostics")]
             present_count: 0,
             font_info: Self::get_font_info(),
@@ -209,23 +229,26 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    /// The window's compositor overlay visual, created lazily on first use.
-    /// Returns `None` when DirectComposition is unavailable.
-    pub(crate) fn compositor_overlay(
+    /// Create an independent compositor overlay visual. The returned handle
+    /// owns the visual; the renderer keeps only a weak reference to it so a
+    /// device-loss rebuild can reach it again. Returns `None` when
+    /// DirectComposition is unavailable or the visual cannot be created.
+    pub(crate) fn create_compositor_overlay(
         &mut self,
     ) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
         let devices = self.devices.as_ref()?;
         let composition = self.direct_composition.as_ref()?;
-        if self.overlay.is_none() {
-            match CompositorOverlay::new(devices, composition) {
-                Ok(overlay) => self.overlay = Some(overlay),
-                Err(error) => {
-                    log::error!("Creating compositor overlay failed: {error}");
-                    return None;
-                }
+        let overlay = match CompositorOverlay::new(devices, composition) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                log::error!("Creating compositor overlay failed: {error}");
+                return None;
             }
-        }
-        let overlay = self.overlay.clone()?;
+        };
+        // Remember a reference to the new overlay, dropping the references to
+        // the overlays the app has already released.
+        retain_live_handles(&mut self.overlays, |_| {});
+        self.overlays.push(Rc::downgrade(&overlay));
         let overlay: Rc<RefCell<dyn PlatformCompositorOverlay>> = overlay;
         Some(overlay)
     }
@@ -350,17 +373,19 @@ impl DirectXRenderer {
             Some(composition)
         };
 
-        if let Some(overlay) = &self.overlay
-            && let Some(composition) = direct_composition.as_ref()
-        {
-            if let Err(error) = overlay
-                .borrow_mut()
-                .rebuild(&devices, composition)
-                .context("Rebuilding compositor overlay")
+        // Rebuild every overlay the app still holds onto the fresh device. A
+        // rebuild that fails keeps its handle: the overlay stays alive with
+        // whatever state it has, and the next device loss tries again.
+        retain_live_handles(&mut self.overlays, |overlay| {
+            if let Some(composition) = direct_composition.as_ref()
+                && let Err(error) = overlay
+                    .borrow_mut()
+                    .rebuild(&devices, composition)
+                    .context("Rebuilding compositor overlay")
             {
                 log::error!("{error:#}");
             }
-        }
+        });
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
@@ -1411,6 +1436,32 @@ fn create_swap_chain(
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
     unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }?;
     Ok(swap_chain)
+}
+
+#[cfg(test)]
+mod compositor_overlay_lifetime_tests {
+    use super::retain_live_handles;
+    use std::rc::Rc;
+
+    #[test]
+    fn a_rebuild_visits_live_overlays_and_forgets_released_ones() {
+        let live = Rc::new(7);
+        let released = Rc::new(9);
+        let mut handles = vec![Rc::downgrade(&live), Rc::downgrade(&released)];
+        drop(released);
+
+        let mut visited = Vec::new();
+        retain_live_handles(&mut handles, |handle| visited.push(**handle));
+
+        assert_eq!(visited, [7], "only the overlay the app still holds");
+        assert_eq!(handles.len(), 1, "the released reference is forgotten");
+        assert!(handles[0].upgrade().is_some(), "the live handle survives");
+        assert_eq!(
+            Rc::strong_count(&live),
+            1,
+            "the renderer holds no strong handle to the overlay"
+        );
+    }
 }
 
 #[inline]

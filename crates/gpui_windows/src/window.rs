@@ -1024,8 +1024,8 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().present_count()
     }
 
-    fn compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
-        self.state.renderer.borrow_mut().compositor_overlay()
+    fn create_compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
+        self.state.renderer.borrow_mut().create_compositor_overlay()
     }
 
     #[cfg(any(test, feature = "test-support"))]
