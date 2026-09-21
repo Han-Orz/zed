@@ -909,22 +909,28 @@ pub struct OpacitySegment {
 /// It is presentation-only: it never receives input and never touches the
 /// window's scene. All methods run on the main thread.
 pub trait PlatformCompositorOverlay {
-    /// Place the overlay at a rectangle in window coordinates, recreating the
-    /// content when the size changes.
+    /// Place the overlay at a rectangle in window coordinates.
     ///
-    /// The position is in physical pixels and fractional: the compositor
-    /// places visuals at sub-pixel offsets, which is what lets an app-side
-    /// animation land between two pixels. The size is whole physical pixels
-    /// because it is the raster size of the overlay's content.
+    /// The position is in physical pixels and fractional: the compositor places
+    /// visuals at sub-pixel offsets, which is what lets an app-side animation land
+    /// between two pixels, and it applies on every call.
+    ///
+    /// The size is whole physical pixels, and a solid color is placed at whatever
+    /// size is asked for. An image is shown at its own raster size instead, so a
+    /// placement an image does not fill leaves the image — and the surface holding
+    /// it — complete and unchanged until the image for that size arrives, which is
+    /// one `set_content_rgba` call away. No order of the two calls can leave the
+    /// overlay holding content that does not cover the surface showing it.
     fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32);
     /// Replace the overlay's content with a small raster image: tightly packed
-    /// premultiplied RGBA8 pixels, exactly `width * height * 4` bytes in
-    /// row-major order with no row padding.
+    /// premultiplied RGBA8 pixels, exactly `width * height * 4` bytes in row-major
+    /// order with no row padding.
     ///
-    /// This is bounded compositor content, not an image system: it is for
-    /// small visuals, and `width` and `height` must match the size the overlay
-    /// is placed at. The overlay remembers the image, so a device-loss rebuild
-    /// restores it without the app uploading again.
+    /// This is bounded compositor content, not an image system: it is for small
+    /// visuals, and the image's own dimensions are the size it is shown at, so an
+    /// image of another size resizes the overlay with it — in one operation,
+    /// drawn before it is shown. The overlay remembers the image, so a device-loss
+    /// rebuild restores it without the app uploading again.
     fn set_content_rgba(&mut self, width: u32, height: u32, pixels: &[u8]);
     /// Fill the overlay with a solid non-premultiplied color.
     fn set_color(&mut self, color: [f32; 4]);
