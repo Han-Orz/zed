@@ -46,7 +46,6 @@ pub(crate) struct CompositorOverlay {
     y: f32,
     width: u32,
     height: u32,
-    color: [f32; 4],
     content: Content,
     /// What the compositor was last told to play. It is also the overlay's
     /// remembered opacity: a rebuild restores the value this motion holds or
@@ -169,7 +168,6 @@ impl CompositorOverlay {
             y: 0.0,
             width: 0,
             height: 0,
-            color: [0.0, 0.0, 0.0, 1.0],
             content: Content::Solid([0.0, 0.0, 0.0, 1.0]),
             // Created invisible: the app's first fade brings it in.
             motion: Motion::Hold(0.0),
@@ -353,7 +351,6 @@ impl CompositorOverlay {
     }
 
     fn set_color_impl(&mut self, color: [f32; 4]) -> Result<()> {
-        self.color = color;
         self.content = Content::Solid(color);
         if let Some(surface) = self.surface.clone() {
             self.fill_surface(&surface, self.width, self.height)?;
