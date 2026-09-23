@@ -5,7 +5,7 @@ use crate::{
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
 ///
@@ -96,6 +96,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -228,6 +229,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             window,
             cx,
         )
@@ -290,6 +292,28 @@ impl WrappedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with_alpha_overrides(origin, line_height, align, bounds, &[], window, cx)
+    }
+
+    /// Paint this line of text with per-range glyph opacity overrides.
+    ///
+    /// Each range is a half-open UTF-8 byte range and its value is an opacity
+    /// factor in the range `0.0..=1.0`. A glyph receives the factor when its
+    /// shaped start byte is contained in the range. The factor is applied only
+    /// to the glyph paint call, so decorations and backgrounds keep their
+    /// existing opacity. The source color is passed unchanged to glyph
+    /// rasterization, preserving its color channels and cache parameters.
+    /// Callers should provide non-overlapping ranges.
+    pub fn paint_with_alpha_overrides(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        alpha_ranges: &[(Range<usize>, f32)],
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
         let align_width = match bounds {
             Some(bounds) => Some(bounds.size.width),
             None => self.layout.wrap_width,
@@ -303,6 +327,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            alpha_ranges,
             window,
             cx,
         )?;
@@ -349,6 +374,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    alpha_ranges: &[(Range<usize>, f32)],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -534,22 +560,26 @@ fn paint_line(
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
-                    if glyph.is_emoji {
-                        window.paint_emoji(
-                            glyph_origin + baseline_offset + vertical_offset,
-                            run.font_id,
-                            glyph.id,
-                            layout.font_size,
-                        )?;
-                    } else {
-                        window.paint_glyph(
-                            glyph_origin + baseline_offset + vertical_offset,
-                            run.font_id,
-                            glyph.id,
-                            layout.font_size,
-                            color,
-                        )?;
-                    }
+                    let glyph_origin = glyph_origin + baseline_offset + vertical_offset;
+                    let alpha_override = alpha_override_for_glyph(glyph.index, alpha_ranges);
+                    window.with_element_opacity(alpha_override, |window| {
+                        if glyph.is_emoji {
+                            window.paint_emoji(
+                                glyph_origin,
+                                run.font_id,
+                                glyph.id,
+                                layout.font_size,
+                            )
+                        } else {
+                            window.paint_glyph(
+                                glyph_origin,
+                                run.font_id,
+                                glyph.id,
+                                layout.font_size,
+                                color,
+                            )
+                        }
+                    })?;
                 }
             }
         }
@@ -585,6 +615,15 @@ fn paint_line(
 
         Ok(())
     })
+}
+
+fn alpha_override_for_glyph(
+    glyph_index: usize,
+    alpha_ranges: &[(Range<usize>, f32)],
+) -> Option<f32> {
+    alpha_ranges
+        .iter()
+        .find_map(|(range, alpha)| range.contains(&glyph_index).then_some(*alpha))
 }
 
 fn paint_line_background(
@@ -1021,5 +1060,16 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    #[test]
+    fn alpha_overrides_use_half_open_utf8_byte_ranges() {
+        let text = "aé🙂";
+        let alpha_ranges = [(1.."aé".len(), 0.25), ("aé".len()..text.len(), 0.5)];
+
+        assert_eq!(alpha_override_for_glyph(0, &alpha_ranges), None);
+        assert_eq!(alpha_override_for_glyph(1, &alpha_ranges), Some(0.25));
+        assert_eq!(alpha_override_for_glyph(3, &alpha_ranges), Some(0.5));
+        assert_eq!(alpha_override_for_glyph(text.len(), &alpha_ranges), None);
     }
 }
