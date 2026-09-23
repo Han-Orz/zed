@@ -303,7 +303,7 @@ impl WrappedLine {
     /// to the glyph paint call, so decorations and backgrounds keep their
     /// existing opacity. The source color is passed unchanged to glyph
     /// rasterization, preserving its color channels and cache parameters.
-    /// Callers should provide non-overlapping ranges.
+    /// Callers should provide sorted, non-overlapping ranges.
     pub fn paint_with_alpha_overrides(
         &self,
         origin: Point<Pixels>,
@@ -621,9 +621,10 @@ fn alpha_override_for_glyph(
     glyph_index: usize,
     alpha_ranges: &[(Range<usize>, f32)],
 ) -> Option<f32> {
-    alpha_ranges
-        .iter()
-        .find_map(|(range, alpha)| range.contains(&glyph_index).then_some(*alpha))
+    let index = alpha_ranges.partition_point(|(range, _)| range.end <= glyph_index);
+    let (range, alpha) = alpha_ranges.get(index)?;
+    (range.start <= glyph_index && glyph_index < range.end && alpha.is_finite())
+        .then_some(alpha.clamp(0.0, 1.0))
 }
 
 fn paint_line_background(
