@@ -944,7 +944,7 @@ impl DirectXRenderer {
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
                 PrimitiveBatch::Shadows(range) => {
-                    for range in visible_ranges(range, local, |index| intersects(scene.shadows[index].bounds, scene.shadows[index].content_mask, target.bounds())) {
+                    for range in visible_ranges(range, local, |index| intersects(shadow_draw_bounds(&scene.shadows[index]), scene.shadows[index].content_mask, target.bounds())) {
                         self.draw_shadows(range.start, range.len())?;
                     }
                     Ok(())
@@ -2062,6 +2062,16 @@ fn opacity_probe_pause() {
     }
 }
 
+fn shadow_draw_bounds(shadow: &Shadow) -> Bounds<ScaledPixels> {
+    // Match shadow_vertex: outer shadows include their Gaussian tail, while
+    // inset shadows draw the element rather than the offset/spread hole.
+    if shadow.inset != 0 {
+        shadow.element_bounds
+    } else {
+        shadow.bounds.dilate(shadow.blur_radius * 3.0)
+    }
+}
+
 fn intersects(
     bounds: Bounds<ScaledPixels>,
     mask: ContentMask<ScaledPixels>,
@@ -2878,5 +2888,86 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(test)]
+mod shadow_coverage_tests {
+    use super::{intersects, shadow_draw_bounds};
+    use gpui::{Bounds, ContentMask, ScaledPixels, Shadow, point, size};
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    fn shadow() -> Shadow {
+        Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(16.0),
+            bounds: bounds(120.0, 40.0, 70.0, 100.0),
+            corner_radii: Default::default(),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 280.0, 200.0),
+            },
+            color: gpui::black(),
+            element_bounds: bounds(120.0, 40.0, 70.0, 100.0),
+            element_corner_radii: Default::default(),
+            inset: 0,
+            pad: 0,
+        }
+    }
+
+    #[test]
+    fn shadow_coverage_includes_outer_tail_and_respects_mask() {
+        let shadow = shadow();
+        let tail = bounds(101.0, 59.0, 5.0, 52.0);
+        let coverage = shadow_draw_bounds(&shadow);
+        assert_eq!(coverage, bounds(72.0, -8.0, 166.0, 196.0));
+        assert!(!intersects(shadow.bounds, shadow.content_mask, tail));
+        assert!(intersects(coverage, shadow.content_mask, tail));
+        assert!(!intersects(
+            coverage,
+            shadow.content_mask,
+            bounds(59.0, 59.0, 5.0, 52.0)
+        ));
+        assert!(!intersects(
+            coverage,
+            ContentMask {
+                bounds: bounds(112.0, 0.0, 148.0, 180.0)
+            },
+            tail
+        ));
+    }
+
+    #[test]
+    fn shadow_coverage_uses_element_bounds_for_inset() {
+        let mut shadow = shadow();
+        shadow.inset = 1;
+        shadow.bounds = bounds(84.0, 54.0, 82.0, 62.0);
+        shadow.element_bounds = bounds(60.0, 30.0, 130.0, 110.0);
+        let rim = bounds(67.0, 59.0, 5.0, 52.0);
+        assert_eq!(shadow_draw_bounds(&shadow), shadow.element_bounds);
+        assert!(!intersects(shadow.bounds, shadow.content_mask, rim));
+        assert!(intersects(
+            shadow_draw_bounds(&shadow),
+            shadow.content_mask,
+            rim
+        ));
+        shadow.bounds = bounds(30.0, 40.0, 70.0, 100.0);
+        shadow.element_bounds = bounds(120.0, 40.0, 70.0, 100.0);
+        let outside_element = bounds(49.0, 59.0, 5.0, 52.0);
+        assert!(intersects(
+            shadow.bounds,
+            shadow.content_mask,
+            outside_element
+        ));
+        assert!(!intersects(
+            shadow_draw_bounds(&shadow),
+            shadow.content_mask,
+            outside_element
+        ));
     }
 }
