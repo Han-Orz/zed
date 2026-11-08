@@ -1,15 +1,14 @@
 use std::{
-    cell::RefCell,
-    rc::{Rc, Weak},
     slice,
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, POINT, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -17,6 +16,7 @@ use windows::{
             DirectWrite::*,
             Dxgi::{Common::*, *},
         },
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
     core::{HSTRING, Interface},
 };
@@ -46,14 +46,11 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
-    /// The compositor overlays this window has handed out. The renderer never
-    /// owns a visual: the app's handle is the ownership, and these weak
-    /// references exist only so a device-loss rebuild can reach the overlays
-    /// that are still alive.
-    overlays: Vec<Weak<RefCell<CompositorOverlay>>>,
     #[cfg(feature = "diagnostics")]
     present_count: u64,
     font_info: &'static FontInfo,
+    local_target: Option<LocalTarget>,
+    timebase: Option<CompositionTimebase>,
 
     width: u32,
     height: u32,
@@ -78,7 +75,7 @@ pub(crate) struct DirectXRendererDevices {
 
 struct DirectXResources {
     // Direct3D rendering objects
-    swap_chain: IDXGISwapChain1,
+    swap_chain: Option<IDXGISwapChain1>,
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
@@ -87,9 +84,154 @@ struct DirectXResources {
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+}
 
-    // Cached viewport
-    viewport: D3D11_VIEWPORT,
+#[derive(Clone)]
+struct PathAttachments {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    msaa: ID3D11Texture2D,
+    view: Option<ID3D11RenderTargetView>,
+    width: u32,
+    height: u32,
+}
+
+impl PathAttachments {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (msaa, view) = create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa,
+            view,
+            width,
+            height,
+        })
+    }
+}
+
+struct LocalTarget {
+    #[cfg(any(test, feature = "test-support"))]
+    texture: ID3D11Texture2D,
+    #[cfg(any(test, feature = "test-support"))]
+    view: Option<ID3D11RenderTargetView>,
+    paths: PathAttachments,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct PassMeasurement {
+    disjoint: ID3D11Query,
+    start: ID3D11Query,
+    end: ID3D11Query,
+    cpu: Instant,
+    encoded_us: u128,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PassMeasurement {
+    fn begin(devices: &DirectXRendererDevices) -> Result<Self> {
+        let query = |kind| -> Result<ID3D11Query> {
+            let mut result = None;
+            unsafe {
+                devices.device.CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: kind,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut result),
+                )?;
+            }
+            result.context("GPU query missing")
+        };
+        let result = Self {
+            disjoint: query(D3D11_QUERY_TIMESTAMP_DISJOINT)?,
+            start: query(D3D11_QUERY_TIMESTAMP)?,
+            end: query(D3D11_QUERY_TIMESTAMP)?,
+            cpu: Instant::now(),
+            encoded_us: 0,
+        };
+        unsafe {
+            devices.device_context.Begin(&result.disjoint);
+            devices.device_context.End(&result.start);
+        }
+        Ok(result)
+    }
+    fn end(&mut self, context: &ID3D11DeviceContext) {
+        self.encoded_us = self.cpu.elapsed().as_micros();
+        unsafe {
+            context.End(&self.end);
+            context.End(&self.disjoint);
+        }
+    }
+    fn report(&self, context: &ID3D11DeviceContext, label: &str, area: u32) -> Result<()> {
+        let mut disjoint = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT::default();
+        let mut start = 0u64;
+        let mut end = 0u64;
+        unsafe {
+            context.GetData(
+                &self.disjoint,
+                Some(&mut disjoint as *mut _ as _),
+                std::mem::size_of_val(&disjoint) as u32,
+                0,
+            )?;
+            context.GetData(&self.start, Some(&mut start as *mut _ as _), 8, 0)?;
+            context.GetData(&self.end, Some(&mut end as *mut _ as _), 8, 0)?;
+        }
+        anyhow::ensure!(
+            !disjoint.Disjoint.as_bool() && disjoint.Frequency > 0 && end >= start,
+            "invalid GPU timing sample"
+        );
+        eprintln!(
+            "COST pass={label} area={area} cpu_us={} gpu_us={:.3}",
+            self.encoded_us,
+            (end - start) as f64 * 1e6 / disjoint.Frequency as f64
+        );
+        Ok(())
+    }
+}
+
+/// Source coordinates stay in the scene; only the destination viewport and
+/// fragment position mapping change. Path attachments have their own origin.
+struct DrawTarget {
+    view: Option<ID3D11RenderTargetView>,
+    region: RECT,
+    offset: POINT,
+    paths: PathAttachments,
+}
+
+#[derive(Clone, Copy)]
+enum ScenePass {
+    Base,
+    LocalEndpoint,
+    #[cfg(any(test, feature = "test-support"))]
+    Reference(f32),
+}
+
+impl DrawTarget {
+    fn viewport(&self) -> D3D11_VIEWPORT {
+        D3D11_VIEWPORT {
+            TopLeftX: self.offset.x as f32,
+            TopLeftY: self.offset.y as f32,
+            Width: (self.region.right - self.region.left) as f32,
+            Height: (self.region.bottom - self.region.top) as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }
+    }
+
+    fn bounds(&self) -> Bounds<ScaledPixels> {
+        Bounds::from_corners(
+            point(
+                ScaledPixels(self.region.left as f32),
+                ScaledPixels(self.region.top as f32),
+            ),
+            point(
+                ScaledPixels(self.region.right as f32),
+                ScaledPixels(self.region.bottom as f32),
+            ),
+        )
+    }
 }
 
 struct DirectXRenderPipelines {
@@ -126,24 +268,50 @@ impl Drop for Annotation<'_> {
 
 pub(crate) struct DirectComposition {
     comp_device: IDCompositionDevice,
-    comp_target: IDCompositionTarget,
-    comp_visual: IDCompositionVisual,
+    _comp_target: IDCompositionTarget,
+    _root_visual: IDCompositionVisual,
+    main_visual: IDCompositionVisual,
+    local_visual: IDCompositionVisual3,
+    main_surface: Option<CompositionSurface>,
+    local_surface: Option<CompositionSurface>,
+    track: Option<Arc<OpacityTrack>>,
 }
 
-/// Visit every handle whose owner is still alive, dropping the references to
-/// the ones that are gone.
-///
-/// A visit cannot remove a handle: a live overlay stays remembered whether or
-/// not its visit succeeded, so a failed device-loss rebuild keeps a visual the
-/// app still holds for the next attempt instead of silently discarding it.
-fn retain_live_handles<T>(handles: &mut Vec<Weak<T>>, mut visit: impl FnMut(&Rc<T>)) {
-    handles.retain(|handle| {
-        let Some(handle) = handle.upgrade() else {
-            return false;
+struct CompositionSurface {
+    surface: IDCompositionSurface,
+    width: u32,
+    height: u32,
+}
+
+struct CompositionTimebase {
+    app: Instant,
+    qpc: i64,
+    frequency: i64,
+}
+
+impl CompositionTimebase {
+    fn new(app: Instant) -> Result<Self> {
+        let mut qpc = 0;
+        let mut frequency = 0;
+        unsafe {
+            QueryPerformanceCounter(&mut qpc)?;
+            QueryPerformanceFrequency(&mut frequency)?;
+        }
+        Ok(Self {
+            app,
+            qpc,
+            frequency,
+        })
+    }
+
+    fn qpc_at(&self, at: Instant) -> i64 {
+        let seconds = if at >= self.app {
+            at.duration_since(self.app).as_secs_f64()
+        } else {
+            -self.app.duration_since(at).as_secs_f64()
         };
-        visit(&handle);
-        true
-    });
+        self.qpc + (seconds * self.frequency as f64).round() as i64
+    }
 }
 
 impl DirectXRendererDevices {
@@ -201,9 +369,6 @@ impl DirectXRenderer {
         } else {
             let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
                 .context("Creating DirectComposition")?;
-            composition
-                .set_swap_chain(&resources.swap_chain)
-                .context("Setting swap chain for DirectComposition")?;
             Some(composition)
         };
 
@@ -215,10 +380,11 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
-            overlays: Vec::new(),
             #[cfg(feature = "diagnostics")]
             present_count: 0,
             font_info: Self::get_font_info(),
+            local_target: None,
+            timebase: None,
             width: 1,
             height: 1,
             skip_draws: false,
@@ -229,30 +395,6 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    /// Create an independent compositor overlay visual. The returned handle
-    /// owns the visual; the renderer keeps only a weak reference to it so a
-    /// device-loss rebuild can reach it again. Returns `None` when
-    /// DirectComposition is unavailable or the visual cannot be created.
-    pub(crate) fn create_compositor_overlay(
-        &mut self,
-    ) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
-        let devices = self.devices.as_ref()?;
-        let composition = self.direct_composition.as_ref()?;
-        let overlay = match CompositorOverlay::new(devices, composition) {
-            Ok(overlay) => overlay,
-            Err(error) => {
-                log::error!("Creating compositor overlay failed: {error}");
-                return None;
-            }
-        };
-        // Remember a reference to the new overlay, dropping the references to
-        // the overlays the app has already released.
-        retain_live_handles(&mut self.overlays, |_| {});
-        self.overlays.push(Rc::downgrade(&overlay));
-        let overlay: Rc<RefCell<dyn PlatformCompositorOverlay>> = overlay;
-        Some(overlay)
-    }
-
     /// Monotonic renderer present count, maintained only in a build that keeps
     /// the platform's presentation evidence (Diagnostic Release).
     #[cfg(feature = "diagnostics")]
@@ -260,36 +402,62 @@ impl DirectXRenderer {
         self.present_count
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
-        let resources = self.resources.as_ref().expect("resources missing");
+    fn pre_draw(&self, target: &DrawTarget, clear_color: &[f32; 4]) -> Result<()> {
         let device_context = &self
             .devices
             .as_ref()
             .expect("devices missing")
             .device_context;
+        self.bind_target(target)?;
+        unsafe {
+            let context: ID3D11DeviceContext1 = device_context.cast()?;
+            let viewport = target.viewport();
+            context.ClearView(
+                target.view.as_ref().context("missing render target view")?,
+                clear_color,
+                Some(&[RECT {
+                    left: target.offset.x,
+                    top: target.offset.y,
+                    right: target.offset.x + viewport.Width as i32,
+                    bottom: target.offset.y + viewport.Height as i32,
+                }]),
+            );
+        }
+        Ok(())
+    }
+
+    fn bind_target(&self, target: &DrawTarget) -> Result<()> {
+        let device_context = &self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context;
+        let viewport = target.viewport();
         update_buffer(
             device_context,
             self.globals.global_params_buffer.as_ref().unwrap(),
             &[GlobalParams {
                 gamma_ratios: self.font_info.gamma_ratios,
-                viewport_size: [resources.viewport.Width, resources.viewport.Height],
+                viewport_size: [viewport.Width, viewport.Height],
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
                 is_bgr: self.font_info.is_bgr as u32,
                 _pad: [0; 3],
+                source_origin: [target.region.left as f32, target.region.top as f32],
+                target_offset: [target.offset.x as f32, target.offset.y as f32],
+                path_texture_size: [target.paths.width as f32, target.paths.height as f32],
+                _target_pad: [0; 2],
             }],
         )?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
-            device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-            device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&target.view)), None);
+            device_context.RSSetViewports(Some(slice::from_ref(&viewport)));
+            device_context.RSSetScissorRects(Some(&[RECT {
+                left: target.offset.x,
+                top: target.offset.y,
+                right: target.offset.x + viewport.Width as i32,
+                bottom: target.offset.y + viewport.Height as i32,
+            }]));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
             device_context
@@ -302,30 +470,41 @@ impl DirectXRenderer {
 
     #[inline]
     fn present(&mut self) -> Result<()> {
-        #[cfg(feature = "diagnostics")]
-        {
-            self.present_count += 1;
-        }
         let result = unsafe {
             self.resources
                 .as_ref()
                 .expect("resources missing")
                 .swap_chain
+                .as_ref()
+                .context("swap chain unavailable")?
                 .Present(0, DXGI_PRESENT(0))
         };
-        result.ok().context("Presenting swap chain failed")
+        result.ok().context("Presenting swap chain failed")?;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.present_count += 1;
+        }
+        Ok(())
     }
 
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        let disable_direct_composition = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .swap_chain
+            .is_some();
         try_to_recover_from_device_lost(|| {
-            self.handle_device_lost_impl(directx_devices)
+            self.handle_device_lost_impl(directx_devices, disable_direct_composition)
                 .context("DirectXRenderer handling device lost")
         })
     }
 
-    fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
-
+    fn handle_device_lost_impl(
+        &mut self,
+        directx_devices: &DirectXDevices,
+        disable_direct_composition: bool,
+    ) -> Result<()> {
         unsafe {
             #[cfg(debug_assertions)]
             if let Some(devices) = &self.devices {
@@ -369,23 +548,8 @@ impl DirectXRenderer {
         } else {
             let composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
-            composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
         };
-
-        // Rebuild every overlay the app still holds onto the fresh device. A
-        // rebuild that fails keeps its handle: the overlay stays alive with
-        // whatever state it has, and the next device loss tries again.
-        retain_live_handles(&mut self.overlays, |overlay| {
-            if let Some(composition) = direct_composition.as_ref()
-                && let Err(error) = overlay
-                    .borrow_mut()
-                    .rebuild(&devices, composition)
-                    .context("Rebuilding compositor overlay")
-            {
-                log::error!("{error:#}");
-            }
-        });
 
         self.atlas
             .handle_device_lost(&devices.device, &devices.device_context);
@@ -400,6 +564,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.local_target = None;
         self.skip_draws = true;
         Ok(())
     }
@@ -414,8 +579,233 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        if self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .swap_chain
+            .is_none()
+        {
+            self.draw_composition(scene, background_appearance)
+        } else {
+            anyhow::ensure!(
+                scene.opacity_quad.is_none(),
+                "opacity tracks require DirectComposition on Windows"
+            );
+            self.render(scene, background_appearance)?;
+            self.present()
+        }
+    }
+
+    fn draw_composition(
+        &mut self,
+        scene: &Scene,
+        appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        if scene.opacity_quad.is_some() {
+            anyhow::ensure!(
+                appearance == WindowBackgroundAppearance::Opaque,
+                "opacity endpoint evaluation requires an opaque window"
+            );
+        }
+        let devices = self.devices.as_ref().context("devices missing")?.clone();
+        if self.timebase.is_none() {
+            self.timebase = Some(CompositionTimebase::new(
+                scene
+                    .presentation_time
+                    .context("scene submission time missing")?,
+            )?);
+        }
+        let mut composition = match self.direct_composition.take() {
+            Some(composition) => composition,
+            None => DirectComposition::new(
+                devices
+                    .dxgi_device
+                    .as_ref()
+                    .context("DXGI device missing")?,
+                self.hwnd,
+            )?,
+        };
+        let result = (|| {
+            composition.ensure_main(self.width, self.height)?;
+            let surface = &composition
+                .main_surface
+                .as_ref()
+                .context("main surface missing")?
+                .surface;
+            let target = self.main_target()?;
+            let requested = target.region;
+            self.draw_surface(scene, appearance, surface, requested, target, false)?;
+            #[cfg(any(test, feature = "test-support"))]
+            opacity_probe_pause();
+
+            if let Some(region) = self.opacity_region(scene) {
+                let width = (region.right - region.left) as u32;
+                let height = (region.bottom - region.top) as u32;
+                composition.ensure_local(width, height)?;
+                let target = self.local_target(region)?;
+                let surface = &composition
+                    .local_surface
+                    .as_ref()
+                    .context("local surface missing")?
+                    .surface;
+                let allocation = composition
+                    .local_surface
+                    .as_ref()
+                    .context("local surface missing")?;
+                let requested = RECT {
+                    left: 0,
+                    top: 0,
+                    right: allocation.width as i32,
+                    bottom: allocation.height as i32,
+                };
+                self.draw_surface(scene, appearance, surface, requested, target, true)?;
+                unsafe {
+                    composition.local_visual.SetContent(surface)?;
+                    composition.local_visual.SetOffsetX2(region.left as f32)?;
+                    composition.local_visual.SetOffsetY2(region.top as f32)?;
+                    composition.local_visual.SetClip2(
+                        &windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
+                            left: 0.0,
+                            top: 0.0,
+                            right: width as f32,
+                            bottom: height as f32,
+                        },
+                    )?;
+                }
+                let track = &scene
+                    .opacity_quad
+                    .as_ref()
+                    .context("opacity quad missing")?
+                    .track;
+                if !composition
+                    .track
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, track))
+                {
+                    composition
+                        .bind_track(track, self.timebase.as_ref().context("timebase missing")?)?;
+                    composition.track = Some(track.clone());
+                }
+            } else {
+                unsafe {
+                    composition
+                        .local_visual
+                        .SetContent(None::<&windows::core::IUnknown>)?;
+                }
+                composition.track = None;
+            }
+            unsafe {
+                #[cfg(any(test, feature = "test-support"))]
+                opacity_probe_pause();
+                composition.main_visual.SetContent(
+                    &composition
+                        .main_surface
+                        .as_ref()
+                        .context("main surface missing")?
+                        .surface,
+                )?;
+                composition.comp_device.Commit()?;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                self.present_count += 1;
+            }
+            Ok(())
+        })();
+        // An unsuccessful preparation must never leak pending surface updates
+        // into a later Commit. Recreate this derived native device next frame.
+        if result.is_ok() {
+            self.direct_composition = Some(composition);
+        }
+        result
+    }
+
+    fn draw_surface(
+        &mut self,
+        scene: &Scene,
+        appearance: WindowBackgroundAppearance,
+        surface: &IDCompositionSurface,
+        requested: RECT,
+        mut target: DrawTarget,
+        local: bool,
+    ) -> Result<()> {
+        let mut offset = POINT::default();
+        let update: IDXGISurface = unsafe { surface.BeginDraw(Some(&requested), &mut offset)? };
+        let drawn = (|| {
+            let texture: ID3D11Texture2D = update.cast()?;
+            let mut description = D3D11_TEXTURE2D_DESC::default();
+            unsafe {
+                texture.GetDesc(&mut description);
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if std::env::var_os("GPUI_ATOMIC_DELAY_MS").is_some() {
+                eprintln!(
+                    "SURFACE local={local} requested={}x{} offset={},{} texture={}x{}",
+                    requested.right - requested.left,
+                    requested.bottom - requested.top,
+                    offset.x,
+                    offset.y,
+                    description.Width,
+                    description.Height
+                );
+            }
+            let width = (requested.right - requested.left) as u64;
+            let height = (requested.bottom - requested.top) as u64;
+            anyhow::ensure!(
+                offset.x >= 0
+                    && offset.y >= 0
+                    && offset.x as u64 + width <= description.Width as u64
+                    && offset.y as u64 + height <= description.Height as u64,
+                "BeginDraw destination is outside the update texture"
+            );
+            target.view = None;
+            unsafe {
+                self.devices
+                    .as_ref()
+                    .context("devices missing")?
+                    .device
+                    .CreateRenderTargetView(&texture, None, Some(&mut target.view))?;
+            }
+            target.offset = offset;
+            if local {
+                let context: ID3D11DeviceContext1 = self
+                    .devices
+                    .as_ref()
+                    .context("devices missing")?
+                    .device_context
+                    .cast()?;
+                unsafe {
+                    context.ClearView(
+                        target.view.as_ref().context("render target view missing")?,
+                        &[1.0; 4],
+                        Some(&[RECT {
+                            left: offset.x,
+                            top: offset.y,
+                            right: offset.x + width as i32,
+                            bottom: offset.y + height as i32,
+                        }]),
+                    );
+                }
+            }
+            self.render_target(
+                scene,
+                appearance,
+                &target,
+                if local {
+                    ScenePass::LocalEndpoint
+                } else {
+                    ScenePass::Base
+                },
+            )
+        })();
+        if let Some(devices) = &self.devices {
+            unsafe {
+                devices.device_context.OMSetRenderTargets(None, None);
+            }
+        }
+        let ended = unsafe { surface.EndDraw() }.map_err(anyhow::Error::from);
+        drawn.and(ended)
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -428,11 +818,120 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
-        self.upload_scene_buffers(scene)?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if resources.render_target.is_none() {
+            let (texture, _) =
+                create_path_intermediate_texture(&devices.device, self.width, self.height)?;
+            unsafe {
+                devices.device.CreateRenderTargetView(
+                    &texture,
+                    None,
+                    Some(&mut resources.render_target_view),
+                )?;
+            }
+            resources.render_target = Some(texture);
+        }
+        let target = self.main_target()?;
+        self.render_target(scene, background_appearance, &target, ScenePass::Base)
+    }
+
+    fn main_target(&self) -> Result<DrawTarget> {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        Ok(DrawTarget {
+            view: resources.render_target_view.clone(),
+            region: RECT {
+                left: 0,
+                top: 0,
+                right: self.width as i32,
+                bottom: self.height as i32,
+            },
+            offset: POINT::default(),
+            paths: PathAttachments {
+                texture: resources.path_intermediate_texture.clone(),
+                srv: resources.path_intermediate_srv.clone(),
+                msaa: resources.path_intermediate_msaa_texture.clone(),
+                view: resources.path_intermediate_msaa_view.clone(),
+                width: self.width,
+                height: self.height,
+            },
+        })
+    }
+
+    fn local_target(&mut self, region: RECT) -> Result<DrawTarget> {
+        let width = (region.right - region.left) as u32;
+        let height = (region.bottom - region.top) as u32;
+        if !self
+            .local_target
+            .as_ref()
+            .is_some_and(|target| target.paths.width >= width && target.paths.height >= height)
+        {
+            let device = &self.devices.as_ref().context("devices missing")?.device;
+            let width = width.next_power_of_two();
+            let height = height.next_power_of_two();
+            #[cfg(any(test, feature = "test-support"))]
+            let (texture, view) = {
+                let (texture, _) = create_path_intermediate_texture(device, width, height)?;
+                let mut view = None;
+                unsafe {
+                    device.CreateRenderTargetView(&texture, None, Some(&mut view))?;
+                }
+                (texture, view)
+            };
+            self.local_target = Some(LocalTarget {
+                #[cfg(any(test, feature = "test-support"))]
+                texture,
+                #[cfg(any(test, feature = "test-support"))]
+                view,
+                paths: PathAttachments::new(device, width, height)?,
+            });
+        }
+        let local = self.local_target.as_ref().context("local target missing")?;
+        #[cfg(any(test, feature = "test-support"))]
+        let view = local.view.clone();
+        #[cfg(not(any(test, feature = "test-support")))]
+        let view = None;
+        Ok(DrawTarget {
+            view,
+            region,
+            offset: POINT::default(),
+            paths: local.paths.clone(),
+        })
+    }
+
+    fn render_target(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+        target: &DrawTarget,
+        pass: ScenePass,
+    ) -> Result<()> {
+        let local = matches!(pass, ScenePass::LocalEndpoint);
+        self.pre_draw(
+            target,
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+        )?;
+        if !local {
+            self.upload_scene_buffers(scene)?;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let ScenePass::Reference(alpha) = pass
+            && let Some(opacity) = &scene.opacity_quad
+        {
+            let mut quads = scene.quads.clone();
+            let quad = &mut quads[opacity.quad_index];
+            quad.background = quad.background.opacity(alpha);
+            quad.border_color = quad.border_color.opacity(alpha);
+            let devices = self.devices.as_ref().context("devices missing")?;
+            self.pipelines.quad_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &quads,
+            )?;
+        }
 
         let annotation = self
             .devices
@@ -444,22 +943,41 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
-                PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                PrimitiveBatch::Shadows(range) => {
+                    for range in visible_ranges(range, local, |index| intersects(scene.shadows[index].bounds, scene.shadows[index].content_mask, target.bounds())) {
+                        self.draw_shadows(range.start, range.len())?;
+                    }
+                    Ok(())
                 }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+                PrimitiveBatch::Quads(range) => {
+                    for range in visible_ranges(range, true, |index| {
+                        (!matches!(pass, ScenePass::Base) || !scene.opacity_quad.as_ref().is_some_and(|quad| quad.quad_index == index))
+                            && (!local || intersects(scene.quads[index].bounds, scene.quads[index].content_mask, target.bounds()))
+                    }) { self.draw_quads(range.start, range.len())?; }
+                    Ok(())
+                }
+                PrimitiveBatch::Paths(range) => {
+                    let paths = if local {
+                        std::borrow::Cow::Owned(scene.paths[range].iter().filter(|path| !path.clipped_bounds().intersect(&target.bounds()).is_empty()).cloned().collect::<Vec<_>>())
+                    } else { std::borrow::Cow::Borrowed(&scene.paths[range]) };
+                    self.draw_paths_to_intermediate(&paths, target)?;
+                    self.draw_paths_from_intermediate(&paths, target)
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    for range in visible_ranges(range, local, |index| intersects(scene.underlines[index].bounds, scene.underlines[index].content_mask, target.bounds())) { self.draw_underlines(range.start, range.len())?; }
+                    Ok(())
+                }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
+                    for range in visible_ranges(range, local, |index| intersects(transformed_bounds(scene.monochrome_sprites[index].bounds, scene.monochrome_sprites[index].transformation), scene.monochrome_sprites[index].content_mask, target.bounds())) { self.draw_monochrome_sprites(texture_id, range.start, range.len())?; }
+                    Ok(())
                 }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
+                    for range in visible_ranges(range, local, |index| intersects(transformed_bounds(scene.subpixel_sprites[index].bounds, scene.subpixel_sprites[index].transformation), scene.subpixel_sprites[index].content_mask, target.bounds())) { self.draw_subpixel_sprites(texture_id, range.start, range.len())?; }
+                    Ok(())
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                    for range in visible_ranges(range, local, |index| intersects(scene.polychrome_sprites[index].bounds, scene.polychrome_sprites[index].content_mask, target.bounds())) { self.draw_polychrome_sprites(texture_id, range.start, range.len())?; }
+                    Ok(())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
@@ -499,17 +1017,113 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
+        let devices = self.devices.as_ref().context("devices missing")?.clone();
+        let mut main_measurement = PassMeasurement::begin(&devices)?;
         self.render(scene, background_appearance)?;
+        main_measurement.end(&devices.device_context);
+        let render_target = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target
+            .as_ref()
+            .context("render target missing")?
+            .clone();
+        let mut image = self.read_texture(&render_target)?;
+        main_measurement.report(&devices.device_context, "main", self.width * self.height)?;
+        if let Some(opacity) = &scene.opacity_quad
+            && let Some(region) = self.opacity_region(scene)
+        {
+            let target = self.local_target(region)?;
+            let mut local_measurement = PassMeasurement::begin(&devices)?;
+            self.render_target(
+                scene,
+                background_appearance,
+                &target,
+                ScenePass::LocalEndpoint,
+            )?;
+            local_measurement.end(&devices.device_context);
+            let local = self
+                .local_target
+                .as_ref()
+                .context("local target missing")?
+                .texture
+                .clone();
+            let endpoint = self.read_texture(&local)?;
+            local_measurement.report(
+                &devices.device_context,
+                "local",
+                (region.right - region.left) as u32 * (region.bottom - region.top) as u32,
+            )?;
+            let alpha = opacity.track.value_at(
+                scene
+                    .presentation_time
+                    .unwrap_or(opacity.track.started_at()),
+            );
+            for y in 0..(region.bottom - region.top) as u32 {
+                for x in 0..(region.right - region.left) as u32 {
+                    let base = image.get_pixel_mut(region.left as u32 + x, region.top as u32 + y);
+                    let endpoint = endpoint.get_pixel(x, y);
+                    for channel in 0..4 {
+                        base[channel] = (base[channel] as f32 * (1.0 - alpha)
+                            + endpoint[channel] as f32 * alpha)
+                            .round() as u8;
+                    }
+                }
+            }
+        }
+        Ok(image)
+    }
 
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let device = &devices.device;
-        let context = &devices.device_context;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        let render_target = resources
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn render_opacity_reference(
+        &mut self,
+        scene: &Scene,
+        appearance: WindowBackgroundAppearance,
+    ) -> Result<image::RgbaImage> {
+        // Allocate the same test-only full target as render_to_image.
+        self.render(scene, appearance)?;
+        let alpha = scene.opacity_quad.as_ref().map_or(0.0, |opacity| {
+            opacity.track.value_at(
+                scene
+                    .presentation_time
+                    .unwrap_or(opacity.track.started_at()),
+            )
+        });
+        self.render_target(
+            scene,
+            appearance,
+            &self.main_target()?,
+            ScenePass::Reference(alpha),
+        )?;
+        let texture = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
             .render_target
             .as_ref()
             .context("render target missing")?;
+        self.read_texture(texture)
+    }
 
+    fn opacity_region(&self, scene: &Scene) -> Option<RECT> {
+        let opacity = scene.opacity_quad.as_ref()?;
+        let quad = &scene.quads[opacity.quad_index];
+        let bounds = quad.bounds.intersect(&quad.content_mask.bounds);
+        let region = RECT {
+            left: (bounds.left().0.floor() as i32 - 1).max(0),
+            top: (bounds.top().0.floor() as i32 - 1).max(0),
+            right: (bounds.right().0.ceil() as i32 + 1).min(self.width as i32),
+            bottom: (bounds.bottom().0.ceil() as i32 + 1).min(self.height as i32),
+        };
+        (region.left < region.right && region.top < region.bottom).then_some(region)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn read_texture(&self, render_target: &ID3D11Texture2D) -> Result<image::RgbaImage> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let device = &devices.device;
+        let context = &devices.device_context;
         // A CPU-readable copy of the render target.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { render_target.GetDesc(&mut desc) };
@@ -579,17 +1193,18 @@ impl DirectXRenderer {
         // The app might have moved to a monitor that's attached to a different graphics device.
         // When a graphics device is removed or reset, the desktop resolution often changes, resulting in a window size change.
         // But here we just return the error, because we are handling device lost scenarios elsewhere.
-        unsafe {
-            resources
-                .swap_chain
-                .ResizeBuffers(
-                    BUFFER_COUNT as u32,
-                    width,
-                    height,
-                    RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
-                .context("Failed to resize swap chain")?;
+        if let Some(swap_chain) = &resources.swap_chain {
+            unsafe {
+                swap_chain
+                    .ResizeBuffers(
+                        BUFFER_COUNT as u32,
+                        width,
+                        height,
+                        RENDER_TARGET_FORMAT,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                    .context("Failed to resize swap chain")?;
+            }
         }
 
         resources.recreate_resources(devices, width, height)?;
@@ -689,24 +1304,32 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        target: &DrawTarget,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
 
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
+        let internal = DrawTarget {
+            view: target.paths.view.clone(),
+            region: target.region,
+            offset: POINT::default(),
+            paths: target.paths.clone(),
+        };
+        self.bind_target(&internal)?;
         // Clear intermediate MSAA texture
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            devices
+                .device_context
+                .ClearRenderTargetView(target.paths.view.as_ref().unwrap(), &[0.0; 4]);
             // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&target.paths.view)), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -737,22 +1360,23 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                &target.paths.texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                &target.paths.msaa,
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
+        self.bind_target(target)?;
 
         Ok(())
     }
 
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_from_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        target: &DrawTarget,
+    ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -780,7 +1404,6 @@ impl DirectXRenderer {
         };
 
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
@@ -790,7 +1413,7 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            slice::from_ref(&target.paths.srv),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
@@ -950,14 +1573,15 @@ impl DirectXResources {
         disable_direct_composition: bool,
     ) -> Result<Self> {
         let swap_chain = if disable_direct_composition {
-            create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
-        } else {
-            create_swap_chain_for_composition(
+            Some(create_swap_chain(
                 &devices.dxgi_factory,
                 &devices.device,
+                hwnd,
                 width,
                 height,
-            )?
+            )?)
+        } else {
+            None
         };
 
         let (
@@ -967,19 +1591,17 @@ impl DirectXResources {
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        ) = create_resources(devices, swap_chain.as_ref(), width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
-            render_target: Some(render_target),
+            render_target,
             render_target_view,
             path_intermediate_texture,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
-            viewport,
         })
     }
 
@@ -997,15 +1619,13 @@ impl DirectXResources {
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
-        self.render_target = Some(render_target);
+        ) = create_resources(devices, self.swap_chain.as_ref(), width, height)?;
+        self.render_target = render_target;
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
-        self.viewport = viewport;
         Ok(())
     }
 }
@@ -1087,29 +1707,71 @@ impl DirectComposition {
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        let main_visual = unsafe { comp_device.CreateVisual() }?;
+        let local_visual: IDCompositionVisual3 = unsafe { comp_device.CreateVisual() }?.cast()?;
+        unsafe {
+            comp_visual.AddVisual(&main_visual, false, None)?;
+            comp_visual.AddVisual(&local_visual, true, &main_visual)?;
+            comp_target.SetRoot(&comp_visual)?;
+        }
 
         Ok(Self {
             comp_device,
-            comp_target,
-            comp_visual,
+            _comp_target: comp_target,
+            _root_visual: comp_visual,
+            main_visual,
+            local_visual,
+            main_surface: None,
+            local_surface: None,
+            track: None,
         })
     }
 
-    pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
-        unsafe {
-            self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
-            self.comp_device.Commit()?;
+    fn ensure_main(&mut self, width: u32, height: u32) -> Result<()> {
+        ensure_composition_surface(&self.comp_device, &mut self.main_surface, width, height)
+    }
+
+    fn ensure_local(&mut self, width: u32, height: u32) -> Result<()> {
+        if !self
+            .local_surface
+            .as_ref()
+            .is_some_and(|surface| surface.width >= width && surface.height >= height)
+        {
+            ensure_composition_surface(
+                &self.comp_device,
+                &mut self.local_surface,
+                width.next_power_of_two(),
+                height.next_power_of_two(),
+            )?;
         }
         Ok(())
     }
 
-    pub(crate) fn comp_device(&self) -> &IDCompositionDevice {
-        &self.comp_device
-    }
-
-    pub(crate) fn root_visual(&self) -> &IDCompositionVisual {
-        &self.comp_visual
+    fn bind_track(&self, track: &OpacityTrack, timebase: &CompositionTimebase) -> Result<()> {
+        if let OpacityEnding::Hold { at_s: 0.0, value } = track.ending() {
+            unsafe {
+                self.local_visual.SetOpacity2(value)?;
+            }
+            return Ok(());
+        }
+        let animation = unsafe { self.comp_device.CreateAnimation()? };
+        for segment in track.segments() {
+            let [a, b, c, d] = segment.coefficients;
+            unsafe {
+                animation.AddCubic(segment.offset_s, a, b, c, d)?;
+            }
+        }
+        unsafe {
+            match track.ending() {
+                OpacityEnding::Hold { at_s, value } => animation.End(at_s, value)?,
+                OpacityEnding::Repeat { at_s, duration_s } => {
+                    animation.AddRepeat(at_s, duration_s)?
+                }
+            }
+            animation.SetAbsoluteBeginTime(timebase.qpc_at(track.started_at()))?;
+            self.local_visual.SetOpacity(&animation)?;
+        }
+        Ok(())
     }
 }
 
@@ -1153,6 +1815,10 @@ struct GlobalParams {
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
     _pad: [u32; 3],
+    source_origin: [f32; 2],
+    target_offset: [f32; 2],
+    path_texture_size: [f32; 2],
+    _target_pad: [u32; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1360,6 +2026,98 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+fn ensure_composition_surface(
+    device: &IDCompositionDevice,
+    slot: &mut Option<CompositionSurface>,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    if !slot
+        .as_ref()
+        .is_some_and(|surface| surface.width == width && surface.height == height)
+    {
+        let surface = unsafe {
+            device.CreateSurface(
+                width,
+                height,
+                RENDER_TARGET_FORMAT,
+                DXGI_ALPHA_MODE_PREMULTIPLIED,
+            )?
+        };
+        *slot = Some(CompositionSurface {
+            surface,
+            width,
+            height,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn opacity_probe_pause() {
+    if let Some(milliseconds) = std::env::var_os("GPUI_ATOMIC_DELAY_MS") {
+        std::thread::sleep(std::time::Duration::from_millis(
+            milliseconds.to_string_lossy().parse().expect("probe delay"),
+        ));
+    }
+}
+
+fn intersects(
+    bounds: Bounds<ScaledPixels>,
+    mask: ContentMask<ScaledPixels>,
+    region: Bounds<ScaledPixels>,
+) -> bool {
+    !bounds.intersect(&mask.bounds).intersect(&region).is_empty()
+}
+
+fn transformed_bounds(
+    bounds: Bounds<ScaledPixels>,
+    transform: TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let points = [
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_left(),
+        bounds.bottom_right(),
+    ]
+    .map(|point| {
+        let point = transform.apply(gpui::point(px(point.x.0), px(point.y.0)));
+        gpui::point(
+            ScaledPixels(point.x.as_f32()),
+            ScaledPixels(point.y.as_f32()),
+        )
+    });
+    let mut result = Bounds::new(points[0], Size::default());
+    for point in points {
+        result = result.union(&Bounds::new(point, Size::default()));
+    }
+    result
+}
+
+fn visible_ranges(
+    mut range: std::ops::Range<usize>,
+    filter: bool,
+    mut visible: impl FnMut(usize) -> bool,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    std::iter::from_fn(move || {
+        if !filter {
+            return (range.start < range.end).then(|| {
+                let result = range.clone();
+                range.start = range.end;
+                result
+            });
+        }
+        while range.start < range.end && !visible(range.start) {
+            range.start += 1;
+        }
+        let start = range.start;
+        while range.start < range.end && visible(range.start) {
+            range.start += 1;
+        }
+        (start < range.start).then_some(start..range.start)
+    })
+}
+
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -1374,37 +2132,11 @@ fn get_comp_device(dxgi_device: &IDXGIDevice) -> Result<IDCompositionDevice> {
     // Create the newest device version that still speaks the v1 interface.
     // A legacy `DCompositionCreateDevice` device produces visuals that do not
     // implement `IDCompositionVisual3` (E_NOINTERFACE), which the compositor
-    // overlay needs for compositor-run opacity animation. The v1 interface
+    // local visual needs for compositor-run opacity animation. The v1 interface
     // itself (CreateTargetForHwnd, CreateVisual, Commit) is unchanged.
     Ok(unsafe {
         DCompositionCreateDevice3(dxgi_device).or_else(|_| DCompositionCreateDevice(dxgi_device))?
     })
-}
-
-fn create_swap_chain_for_composition(
-    dxgi_factory: &IDXGIFactory6,
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-) -> Result<IDXGISwapChain1> {
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: width,
-        Height: height,
-        Format: RENDER_TARGET_FORMAT,
-        Stereo: false.into(),
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: BUFFER_COUNT as u32,
-        // Composition SwapChains only support the DXGI_SCALING_STRETCH Scaling.
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
-    };
-    Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
 }
 
 fn create_swap_chain(
@@ -1438,61 +2170,30 @@ fn create_swap_chain(
     Ok(swap_chain)
 }
 
-#[cfg(test)]
-mod compositor_overlay_lifetime_tests {
-    use super::retain_live_handles;
-    use std::rc::Rc;
-
-    #[test]
-    fn a_rebuild_visits_live_overlays_and_forgets_released_ones() {
-        let live = Rc::new(7);
-        let released = Rc::new(9);
-        let mut handles = vec![Rc::downgrade(&live), Rc::downgrade(&released)];
-        drop(released);
-
-        let mut visited = Vec::new();
-        retain_live_handles(&mut handles, |handle| visited.push(**handle));
-
-        assert_eq!(visited, [7], "only the overlay the app still holds");
-        assert_eq!(handles.len(), 1, "the released reference is forgotten");
-        assert!(handles[0].upgrade().is_some(), "the live handle survives");
-        assert_eq!(
-            Rc::strong_count(&live),
-            1,
-            "the renderer holds no strong handle to the overlay"
-        );
-    }
-}
-
 #[inline]
 fn create_resources(
     devices: &DirectXRendererDevices,
-    swap_chain: &IDXGISwapChain1,
+    swap_chain: Option<&IDXGISwapChain1>,
     width: u32,
     height: u32,
 ) -> Result<(
-    ID3D11Texture2D,
+    Option<ID3D11Texture2D>,
     Option<ID3D11RenderTargetView>,
     ID3D11Texture2D,
     Option<ID3D11ShaderResourceView>,
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    D3D11_VIEWPORT,
 )> {
-    let (render_target, render_target_view) =
-        create_render_target_and_its_view(swap_chain, &devices.device)?;
+    let (render_target, render_target_view) = if let Some(swap_chain) = swap_chain {
+        let (texture, view) = create_render_target_and_its_view(swap_chain, &devices.device)?;
+        (Some(texture), view)
+    } else {
+        (None, None)
+    };
     let (path_intermediate_texture, path_intermediate_srv) =
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
         create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
-    let viewport = D3D11_VIEWPORT {
-        TopLeftX: 0.0,
-        TopLeftY: 0.0,
-        Width: width as f32,
-        Height: height as f32,
-        MinDepth: 0.0,
-        MaxDepth: 1.0,
-    };
     Ok((
         render_target,
         render_target_view,
@@ -1500,7 +2201,6 @@ fn create_resources(
         path_intermediate_srv,
         path_intermediate_msaa_texture,
         path_intermediate_msaa_view,
-        viewport,
     ))
 }
 
@@ -1589,7 +2289,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };

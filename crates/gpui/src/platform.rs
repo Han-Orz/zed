@@ -59,7 +59,6 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
@@ -873,84 +872,6 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
-/// The interpolation shape of one [`OpacitySegment`]. The platform maps
-/// these to whatever its compositor supports natively; on DirectComposition
-/// both map to polynomial animation segments.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum OpacityEase {
-    /// The value stays constant across the segment.
-    Hold,
-    /// The value moves from the segment's start value to its end value with a
-    /// symmetric ease-in-out profile.
-    Smooth,
-}
-
-/// One constant-or-eased span of a compositor-run opacity animation.
-///
-/// Times are seconds from the animation's start; the first segment must start
-/// at zero and segments must be contiguous and ordered.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OpacitySegment {
-    /// Seconds from the animation's start where this segment begins.
-    pub start_s: f64,
-    /// Seconds from the animation's start where this segment ends.
-    pub end_s: f64,
-    /// The opacity when the segment begins.
-    pub start_value: f32,
-    /// The opacity when the segment ends.
-    pub end_value: f32,
-    /// How the value moves between the segment's ends.
-    pub ease: OpacityEase,
-}
-
-/// A small compositor-owned overlay visual: platform content the compositor
-/// can position, color and animate without the app rendering a frame.
-///
-/// It is presentation-only: it never receives input and never touches the
-/// window's scene. All methods run on the main thread.
-pub trait PlatformCompositorOverlay {
-    /// Place the overlay at a rectangle in window coordinates.
-    ///
-    /// The position is in physical pixels and fractional: the compositor places
-    /// visuals at sub-pixel offsets, which is what lets an app-side animation land
-    /// between two pixels, and it applies on every call.
-    ///
-    /// The size is whole physical pixels. It is remembered as the overlay's
-    /// placement, and an overlay is shown at the size its content can fill: a
-    /// solid color fills whatever size is asked for, while an image is shown at
-    /// its own raster size instead. A placement an image does not fill therefore
-    /// leaves the image — and the surface holding it — complete and unchanged
-    /// until the image for that size arrives, which is one `set_content_rgba` call
-    /// away, and the placement still stands for a later solid color and for a
-    /// rebuild after device loss. No order of the two calls can leave the overlay
-    /// holding content that does not cover the surface showing it.
-    fn set_geometry(&mut self, x: f32, y: f32, width: u32, height: u32);
-    /// Replace the overlay's content with a small raster image: tightly packed
-    /// premultiplied RGBA8 pixels, exactly `width * height * 4` bytes in row-major
-    /// order with no row padding.
-    ///
-    /// This is bounded compositor content, not an image system: it is for small
-    /// visuals, and the image's own dimensions are the size it is shown at, so an
-    /// image of another size resizes the overlay with it — in one operation,
-    /// drawn before it is shown. The overlay remembers the image, so a device-loss
-    /// rebuild restores it without the app uploading again.
-    fn set_content_rgba(&mut self, width: u32, height: u32, pixels: &[u8]);
-    /// Fill the overlay with a solid non-premultiplied color.
-    fn set_color(&mut self, color: [f32; 4]);
-    /// Move the overlay to `target` opacity over `duration_s` seconds, from
-    /// whatever opacity it shows right now, and hold it there. The compositor
-    /// runs the fade; the app is not woken while it plays. `target` zero is a
-    /// hidden overlay, reached by fading rather than by snapping it off.
-    fn fade_opacity(&mut self, target: f32, duration_s: f64);
-    /// Replace whatever opacity animation is running with a compositor-run
-    /// animation that plays `segments` once from the next commit and then
-    /// repeats the whole cycle indefinitely. The compositor executes the
-    /// animation; the app is not woken while it runs.
-    fn animate_opacity_cycle(&mut self, segments: &[OpacitySegment]);
-    /// Stop any opacity animation and hold `opacity`.
-    fn hold_opacity(&mut self, opacity: f32);
-}
-
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -1039,13 +960,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(feature = "diagnostics")]
     fn present_count(&self) -> u64 {
         0
-    }
-    /// Create a compositor overlay visual, when the platform supports one.
-    /// Every call returns a fresh handle the caller owns; dropping the last
-    /// handle releases the visual.
-    #[cfg(target_os = "windows")]
-    fn create_compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
-        None
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -1175,6 +1089,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
+    }
+
+    /// Direct full-scene reference for testing a single opacity contribution.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_opacity_reference(&self, _scene: &Scene) -> Result<RgbaImage> {
+        anyhow::bail!("opacity reference rendering not implemented for this platform")
+    }
+
+    /// Exercise the renderer's device-resource recovery with a fresh device.
+    #[cfg(any(test, feature = "test-support"))]
+    fn rebuild_graphics_resources_for_test(&self) -> Result<()> {
+        anyhow::bail!("graphics recovery testing not implemented for this platform")
     }
 }
 

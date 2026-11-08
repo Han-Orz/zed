@@ -7,6 +7,10 @@ cbuffer GlobalParams: register(b0) {
     float subpixel_enhanced_contrast;
     uint is_bgr;
     uint3 global_pad;
+    float2 source_origin;
+    float2 target_offset;
+    float2 path_texture_size;
+    uint2 target_pad;
 };
 
 cbuffer BatchParams: register(b1) {
@@ -99,8 +103,12 @@ static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 
 float4 to_device_position_impl(float2 position) {
-    float2 device_position = position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    float2 device_position = (position - source_origin) / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
     return float4(device_position, 0., 1.);
+}
+
+float2 scene_position(float2 target_position) {
+    return target_position + source_origin - target_offset;
 }
 
 float4 to_device_position(float2 unit_vertex, Bounds bounds) {
@@ -282,7 +290,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
                                       TransformationMatrix transformation) {
     float2 position = unit_vertex * bounds.size + bounds.origin;
     float2 transformed = mul(position, transformation.rotation_scale) + transformation.translation;
-    float2 device_position = transformed / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    float2 device_position = (transformed - source_origin) / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
     return float4(device_position, 0.0, 1.0);
 }
 
@@ -558,7 +566,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
-    float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    float4 background_color = gradient_color(quad.background, scene_position(input.position.xy), quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -577,7 +585,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     float2 size = quad.bounds.size;
     float2 half_size = size / 2.;
-    float2 the_point = input.position.xy - quad.bounds.origin;
+    float2 the_point = scene_position(input.position.xy) - quad.bounds.origin;
     float2 center_to_point = the_point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -915,12 +923,12 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 
     float2 half_size = shadow.bounds.size / 2.;
     float2 center = shadow.bounds.origin + half_size;
-    float2 point0 = input.position.xy - center;
+    float2 point0 = scene_position(input.position.xy) - center;
     float corner_radius = pick_corner_radius(point0, shadow.corner_radii);
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float distance = quad_sdf(scene_position(input.position.xy), shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -945,7 +953,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+        float element_distance = quad_sdf(scene_position(input.position.xy), shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
@@ -1014,7 +1022,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, scene_position(input.position.xy), bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
@@ -1044,7 +1052,7 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
     float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
+    float2 texture_coords = (screen_position - source_origin) / path_texture_size;
 
     PathSpriteVertexOutput output;
     output.position = device_position;
@@ -1113,7 +1121,7 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
         float half_thickness = underline.thickness * 0.5;
         float2 origin = underline.bounds.origin;
 
-        float2 st = ((input.position.xy - origin) / underline.bounds.size.y) - float2(0., 0.5);
+        float2 st = ((scene_position(input.position.xy) - origin) / underline.bounds.size.y) - float2(0., 0.5);
         float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.y;
         float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1256,7 +1264,7 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
-    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float distance = quad_sdf(scene_position(input.position.xy), sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
     if (sprite.grayscale != 0u) {

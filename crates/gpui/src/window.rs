@@ -1790,14 +1790,16 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present(cx.background_executor().now());
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if needs_present {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| {
+                            window.present(cx.background_executor().now())
+                        })
                         .log_err();
                 }
 
@@ -2793,19 +2795,6 @@ impl Window {
         self.platform_window.present_count()
     }
 
-    /// Creates an independent compositor overlay visual when the platform
-    /// supports one. Each call returns a new handle owned by the caller, and
-    /// the visual lives until that handle is dropped. The overlay is
-    /// presentation-only platform content the compositor can position and
-    /// animate without the app rendering a frame; it never receives input and
-    /// never touches the window's scene.
-    #[cfg(target_os = "windows")]
-    pub fn create_compositor_overlay(
-        &self,
-    ) -> Option<Rc<RefCell<dyn crate::platform::PlatformCompositorOverlay>>> {
-        self.platform_window.create_compositor_overlay()
-    }
-
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
     /// On mac, this is equivalent to `is_window_active`.
@@ -3339,11 +3328,12 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&mut self) {
+    fn present(&mut self, at: Instant) {
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        self.rendered_frame.scene.presentation_time = Some(at);
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3360,7 +3350,7 @@ impl Window {
     #[cfg(all(test, feature = "profiler"))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            self.present(Instant::now());
         }
     }
 
@@ -4469,6 +4459,62 @@ impl Window {
                 });
             }
         }
+    }
+
+    /// Render the same scene directly with its sampled opacity, for pixel
+    /// comparison against endpoint evaluation. Does not present a frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_opacity_reference(&self) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .render_opacity_reference(&self.rendered_frame.scene)
+    }
+
+    /// Rebuild native graphics resources on a fresh device and force a new
+    /// scene/atlas. This exercises recovery; it does not remove GPU hardware.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rebuild_graphics_resources_for_test(&self) -> anyhow::Result<()> {
+        self.platform_window.rebuild_graphics_resources_for_test()
+    }
+
+    /// Paint one local quad with an immutable opacity program. It participates
+    /// in ordinary scene order, clip and parent opacity. Only one such quad is
+    /// supported per scene; overlapping independent contributions are not affine.
+    pub fn paint_opacity_quad(&mut self, quad: PaintQuad, track: Arc<crate::OpacityTrack>) {
+        assert!(
+            cfg!(target_os = "windows"),
+            "opacity tracks currently require the Windows DirectComposition renderer"
+        );
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_opacity_quad(
+            Quad {
+                order: 0,
+                bounds: quad.bounds.scale(self.scale_factor()),
+                content_mask: self.content_mask().scale(self.scale_factor()),
+                background: quad.background.opacity(opacity),
+                border_color: quad.border_color.opacity(opacity),
+                corner_radii: quad.corner_radii.scale(self.scale_factor()),
+                border_widths: quad.border_widths.scale(self.scale_factor()),
+                border_style: quad.border_style,
+            },
+            track,
+        );
+    }
+
+    /// Whether this frame's paint stream contains the single opacity quad,
+    /// including an opcode replayed from a cached element.
+    pub fn has_opacity_quad(&self) -> bool {
+        self.next_frame.scene.opacity_quad.is_some()
+    }
+
+    /// The current committed opacity material and its original time program.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_opacity_quad(&self) -> Option<(&Quad, &Arc<crate::OpacityTrack>)> {
+        let opacity = self.rendered_frame.scene.opacity_quad.as_ref()?;
+        Some((
+            &self.rendered_frame.scene.quads[opacity.quad_index],
+            &opacity.track,
+        ))
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

@@ -1024,16 +1024,31 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().present_count()
     }
 
-    fn create_compositor_overlay(&self) -> Option<Rc<RefCell<dyn PlatformCompositorOverlay>>> {
-        self.state.renderer.borrow_mut().create_compositor_overlay()
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         self.state
             .renderer
             .borrow_mut()
             .render_to_image(scene, self.state.background_appearance.get())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_opacity_reference(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .render_opacity_reference(scene, self.state.background_appearance.get())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn rebuild_graphics_resources_for_test(&self) -> anyhow::Result<()> {
+        let devices = DirectXDevices::new()?;
+        self.state
+            .renderer
+            .borrow_mut()
+            .handle_device_lost(&devices)?;
+        self.state.force_render_pending.set(true);
+        Ok(())
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

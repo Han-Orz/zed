@@ -13,6 +13,8 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
+    time::Instant,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -39,6 +41,10 @@ impl From<bool> for PaddedBool32 {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    /// The application clock sample corresponding to submission of this scene.
+    pub presentation_time: Option<Instant>,
+    /// At most one independently time-varying quad; its material stays in `quads`.
+    pub opacity_quad: Option<OpacityQuad>,
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
@@ -52,9 +58,19 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
 }
 
+/// A time-varying material reference into the normally sorted quad stream.
+pub struct OpacityQuad {
+    /// Index into `Scene::quads`, updated when the scene is sorted.
+    pub quad_index: usize,
+    /// The one immutable time program.
+    pub track: Arc<crate::OpacityTrack>,
+}
+
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        self.presentation_time = None;
+        self.opacity_quad = None;
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -144,11 +160,24 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::OpacityQuad(quad, track) => {
+                    self.insert_opacity_quad(*quad, track.clone())
+                }
             }
         }
     }
 
     pub fn finish(&mut self) {
+        if let Some(opacity) = &mut self.opacity_quad {
+            let index = opacity.quad_index;
+            let order = self.quads[index].order;
+            opacity.quad_index = self
+                .quads
+                .iter()
+                .enumerate()
+                .filter(|(i, quad)| quad.order < order || (quad.order == order && *i < index))
+                .count();
+        }
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -160,6 +189,30 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    /// Insert a single affine opacity contribution without changing draw ordering.
+    pub fn insert_opacity_quad(&mut self, quad: Quad, track: Arc<crate::OpacityTrack>) {
+        assert!(
+            self.opacity_quad.is_none(),
+            "a scene supports only one opacity quad"
+        );
+        assert!(
+            quad.background.tag == crate::color::BackgroundTag::Solid
+                && quad.border_widths == Edges::default(),
+            "opacity quads require one solid fill without a border"
+        );
+        let before = self.quads.len();
+        self.insert_primitive(quad);
+        if self.quads.len() != before {
+            self.paint_operations.pop();
+            self.paint_operations
+                .push(PaintOperation::OpacityQuad(quad, track.clone()));
+            self.opacity_quad = Some(OpacityQuad {
+                quad_index: before,
+                track,
+            });
+        }
     }
 
     #[cfg_attr(
@@ -212,6 +265,7 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
+    OpacityQuad(Quad, Arc<crate::OpacityTrack>),
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
@@ -945,5 +999,65 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod opacity_tests {
+    use super::*;
+    use crate::{OpacityTrack, size};
+
+    fn quad(x: f32) -> Quad {
+        let bounds = Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(0.0)),
+            size(ScaledPixels(20.0), ScaledPixels(30.0)),
+        );
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn opacity_quad_keeps_normal_order_and_cached_track_identity() {
+        let track = Arc::new(OpacityTrack::constant(Instant::now(), 0.5));
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.0));
+        scene.insert_opacity_quad(quad(5.0), track.clone());
+        scene.insert_primitive(quad(8.0));
+        scene.finish();
+        let opacity = scene.opacity_quad.as_ref().unwrap();
+        assert_eq!(opacity.quad_index, 1);
+        assert!(scene.quads[0].order < scene.quads[1].order);
+        assert!(scene.quads[1].order < scene.quads[2].order);
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        replay.finish();
+        assert!(Arc::ptr_eq(
+            &replay.opacity_quad.as_ref().unwrap().track,
+            &track
+        ));
+        assert_eq!(replay.opacity_quad.as_ref().unwrap().quad_index, 1);
+        replay.clear();
+        assert!(replay.opacity_quad.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "only one opacity quad")]
+    fn independently_fading_overlapping_parts_are_rejected() {
+        let track = Arc::new(OpacityTrack::constant(Instant::now(), 0.5));
+        let mut scene = Scene::default();
+        scene.insert_opacity_quad(quad(0.0), track.clone());
+        scene.insert_opacity_quad(quad(1.0), track);
+    }
+
+    #[test]
+    #[should_panic(expected = "one solid fill without a border")]
+    fn multiple_material_contributions_are_rejected() {
+        let mut quad = quad(0.0);
+        quad.border_widths.top = ScaledPixels(1.0);
+        Scene::default()
+            .insert_opacity_quad(quad, Arc::new(OpacityTrack::constant(Instant::now(), 0.5)));
     }
 }
