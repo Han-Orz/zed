@@ -148,7 +148,9 @@ impl UniformListScrollHandle {
     /// If the item is out of view, it scrolls the minimum amount to bring it into view according
     /// to the strategy.
     pub fn scroll_to_item(&self, ix: usize, strategy: ScrollStrategy) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        let mut state = self.0.borrow_mut();
+        state.base_handle.cancel_scroll_motion();
+        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -161,7 +163,9 @@ impl UniformListScrollHandle {
     /// This uses strict scrolling: the item will always be scrolled to match the strategy position,
     /// even if it's already visible. Use this when you need precise positioning.
     pub fn scroll_to_item_strict(&self, ix: usize, strategy: ScrollStrategy) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        let mut state = self.0.borrow_mut();
+        state.base_handle.cancel_scroll_motion();
+        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset: 0,
@@ -180,7 +184,9 @@ impl UniformListScrollHandle {
     /// - `ScrollStrategy::Center`: Shrinks from top, centers item in the reduced viewport
     /// - `ScrollStrategy::Bottom`: Shrinks from bottom, positions item at the new bottom
     pub fn scroll_to_item_with_offset(&self, ix: usize, strategy: ScrollStrategy, offset: usize) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        let mut state = self.0.borrow_mut();
+        state.base_handle.cancel_scroll_motion();
+        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,
@@ -204,7 +210,9 @@ impl UniformListScrollHandle {
         strategy: ScrollStrategy,
         offset: usize,
     ) {
-        self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
+        let mut state = self.0.borrow_mut();
+        state.base_handle.cancel_scroll_motion();
+        state.deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
             strategy,
             offset,
@@ -367,7 +375,7 @@ impl Element for UniformList {
             height: longest_item_size.height * self.item_count,
         };
 
-        let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
+        let shared_scroll_state = self.interactivity.scroll_state.clone().unwrap();
         let item_height = longest_item_size.height;
         let shared_scroll_to_item = self.scroll_handle.as_mut().and_then(|handle| {
             let mut handle = handle.0.borrow_mut();
@@ -400,16 +408,20 @@ impl Element for UniformList {
                     let max_scroll_offset = padded_bounds.size.height - content_height;
 
                     if is_scrolled_vertically && scroll_offset.y < max_scroll_offset {
-                        shared_scroll_offset.borrow_mut().y = max_scroll_offset;
                         scroll_offset.y = max_scroll_offset;
+                        shared_scroll_state
+                            .borrow_mut()
+                            .constrain_offset(scroll_offset);
                     }
 
                     let content_width = content_size.width + padding.left + padding.right;
                     let is_scrolled_horizontally =
                         can_scroll_horizontally && !scroll_offset.x.is_zero();
                     if is_scrolled_horizontally && content_width <= padded_bounds.size.width {
-                        shared_scroll_offset.borrow_mut().x = Pixels::ZERO;
                         scroll_offset.x = Pixels::ZERO;
+                        shared_scroll_state
+                            .borrow_mut()
+                            .constrain_offset(scroll_offset);
                     }
 
                     if let Some(DeferredScrollToItem {
@@ -423,7 +435,7 @@ impl Element for UniformList {
                             item_index = self.item_count.saturating_sub(item_index + 1);
                         }
                         let list_height = padded_bounds.size.height;
-                        let mut updated_scroll_offset = shared_scroll_offset.borrow_mut();
+                        let mut updated_scroll_offset = shared_scroll_state.borrow().offset();
                         let item_top = item_height * item_index;
                         let item_bottom = item_top + item_height;
                         let scroll_top = -updated_scroll_offset.y;
@@ -467,7 +479,10 @@ impl Element for UniformList {
                                 }
                             }
                         }
-                        scroll_offset = *updated_scroll_offset
+                        shared_scroll_state
+                            .borrow_mut()
+                            .set_offset(updated_scroll_offset);
+                        scroll_offset = updated_scroll_offset;
                     }
 
                     let first_visible_element_ix =

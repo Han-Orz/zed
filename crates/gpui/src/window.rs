@@ -1180,6 +1180,11 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    animation_frame_views: RefCell<FxHashSet<EntityId>>,
+    // A queued callback can outlive interrupted motion. Only requests made
+    // during this draw may keep the application's finite activity span open.
+    animation_frame_requested: Cell<bool>,
+    frame_time: Instant,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1886,6 +1891,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.cancel_native_scroll_motion();
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -1910,6 +1918,9 @@ impl Window {
                             return;
                         }
                         window.visibility = visibility;
+                        if !visibility.is_visible() {
+                            window.cancel_native_scroll_motion();
+                        }
                         window
                             .visibility_observers
                             .clone()
@@ -2040,6 +2051,9 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            animation_frame_views: RefCell::default(),
+            animation_frame_requested: Cell::new(false),
+            frame_time: cx.background_executor().now(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2606,8 +2620,43 @@ impl Window {
     /// method directly for decorative motion, check [`App::reduce_motion`]
     /// and skip the frame request when it is set.
     pub fn request_animation_frame(&self) {
-        let entity = self.current_view();
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        self.animation_frame_requested.set(true);
+        let mut views = self.animation_frame_views.borrow_mut();
+        let schedule = views.is_empty();
+        views.insert(self.current_view());
+        drop(views);
+        if schedule {
+            self.on_next_frame(|window, cx| {
+                let views = mem::take(&mut *window.animation_frame_views.borrow_mut());
+                for entity in views {
+                    cx.notify(entity);
+                }
+            });
+        }
+    }
+
+    /// The one executor-clock sample shared by this draw's presentation.
+    pub fn frame_time(&self) -> Instant {
+        self.frame_time
+    }
+
+    /// Whether this draw has requested another animation frame. This is not
+    /// the presence of an older callback that has yet to be delivered.
+    pub fn has_animation_frame_demand(&self) -> bool {
+        self.animation_frame_requested.get()
+    }
+
+    fn cancel_native_scroll_motion(&mut self) {
+        for frame in [&mut self.rendered_frame, &mut self.next_frame] {
+            for state in frame.element_states.values_mut() {
+                if let Some(Some(state)) = state
+                    .inner
+                    .downcast_mut::<Option<crate::InteractiveElementState>>()
+                {
+                    state.cancel_scroll_motion();
+                }
+            }
+        }
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
@@ -3150,6 +3199,8 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.frame_time = cx.background_executor().now();
+        self.animation_frame_requested.set(false);
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -7690,6 +7741,169 @@ mod tests {
 
     struct OpensWindowOnPaint {
         opened: Rc<Cell<bool>>,
+    }
+
+    struct AnimationFrameChild {
+        renders: Rc<Cell<usize>>,
+        active: Rc<Cell<bool>>,
+    }
+
+    impl Render for AnimationFrameChild {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            if self.active.get() {
+                window.request_animation_frame();
+                window.request_animation_frame();
+            }
+            div().size_full()
+        }
+    }
+
+    struct AnimationFrameRoot {
+        children: [crate::Entity<AnimationFrameChild>; 2],
+    }
+
+    impl Render for AnimationFrameRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .children(self.children.iter().map(|child| {
+                    child
+                        .clone()
+                        .cached(crate::StyleRefinement::default().w(px(100.0)).h(px(100.0)))
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn animation_frame_demand_merges_without_losing_cached_child_notifications(
+        cx: &mut TestAppContext,
+    ) {
+        let renders = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
+        let active = Rc::new(Cell::new(true));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            let active = active.clone();
+            move |_, cx| AnimationFrameRoot {
+                children: renders.map(|renders| {
+                    cx.new(|_| AnimationFrameChild {
+                        renders,
+                        active: active.clone(),
+                    })
+                }),
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            assert_eq!(window.animation_frame_views.borrow().len(), 2);
+            assert_eq!(window.next_frame_callbacks.borrow().len(), 1);
+            assert!(window.has_animation_frame_demand());
+            window.draw(cx).clear(cx);
+            assert!(
+                !window.has_animation_frame_demand(),
+                "cached replay does not renew demand"
+            );
+            assert_eq!(window.next_frame_callbacks.borrow().len(), 1);
+        })
+        .unwrap();
+        let before = renders.each_ref().map(|count| count.get());
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 1);
+        })
+        .unwrap();
+        // Let App deliver the two entity notifications before choosing caches.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(window.animation_frame_views.borrow().len(), 2);
+            assert_eq!(window.next_frame_callbacks.borrow().len(), 1);
+        })
+        .unwrap();
+        for (index, count) in renders.iter().enumerate() {
+            assert_eq!(
+                count.get(),
+                before[index] + 1,
+                "each real child is invalidated"
+            );
+        }
+        active.set(false);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(!window.has_animation_frame_demand());
+            assert_eq!(window.simulate_next_frame(cx), 0);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn animation_frame_requests_inside_callback_and_business_callbacks_stay_independent(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| EmptyView);
+        cx.update_window(window.into(), |root, window, cx| {
+            let view = root.entity_id();
+            window.invalidator.set_phase(super::DrawPhase::Paint);
+            window.with_rendered_view(view, |window| {
+                window.request_animation_frame();
+                window.request_animation_frame();
+            });
+            window.on_next_frame(move |window, _| {
+                window.with_rendered_view(view, |window| {
+                    window.request_animation_frame();
+                    window.request_animation_frame();
+                });
+            });
+            assert_eq!(window.simulate_next_frame(cx), 2);
+            assert_eq!(window.next_frame_callbacks.borrow().len(), 1);
+            assert_eq!(window.simulate_next_frame(cx), 1);
+            assert_eq!(window.simulate_next_frame(cx), 0);
+            window.invalidator.set_phase(super::DrawPhase::None);
+        })
+        .unwrap();
+    }
+
+    struct FrameTimeView {
+        samples: Rc<RefCell<Vec<std::time::Instant>>>,
+    }
+
+    impl Render for FrameTimeView {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.samples.borrow_mut().push(window.frame_time());
+            let prepaint_samples = self.samples.clone();
+            let paint_samples = self.samples.clone();
+            canvas(
+                move |_, window, _| prepaint_samples.borrow_mut().push(window.frame_time()),
+                move |_, _, window, _| paint_samples.borrow_mut().push(window.frame_time()),
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn animation_frame_time_is_one_executor_sample_for_all_draw_phases(cx: &mut TestAppContext) {
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let samples = samples.clone();
+            move |_, _| FrameTimeView { samples }
+        });
+        samples.borrow_mut().clear();
+        let first = cx.background_executor.now();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(*samples.borrow(), [first; 3]);
+        samples.borrow_mut().clear();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(30));
+        let second = cx.background_executor.now();
+        assert!(second > first);
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(*samples.borrow(), [second; 3]);
     }
 
     impl Render for OpensWindowOnPaint {

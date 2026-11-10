@@ -39,7 +39,7 @@ use std::{
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::ImageCacheProvider;
@@ -2140,7 +2140,7 @@ pub struct Interactivity {
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
-    pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scroll_state: Option<Rc<RefCell<NativeScrollState>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2266,16 +2266,17 @@ impl Interactivity {
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     let scroll_handle_state = scroll_handle.0.borrow();
-                    self.scroll_offset = Some(scroll_handle_state.offset.clone());
+                    self.scroll_state = Some(scroll_handle_state.scroll.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
                 {
-                    self.scroll_offset = Some(
+                    self.scroll_state = Some(
                         element_state
-                            .scroll_offset
-                            .get_or_insert_with(Rc::default)
+                            .scroll_binding
+                            .get_or_insert_with(|| ScrollBinding(Rc::default()))
+                            .0
                             .clone(),
                     );
                     self.ongoing_scroll = Some(
@@ -2284,6 +2285,21 @@ impl Interactivity {
                             .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
                             .clone(),
                     );
+                }
+
+                if let Some(element_state) = element_state.as_mut() {
+                    match &self.scroll_state {
+                        Some(scroll) => {
+                            if !element_state
+                                .scroll_binding
+                                .as_ref()
+                                .is_some_and(|binding| Rc::ptr_eq(&binding.0, scroll))
+                            {
+                                element_state.scroll_binding = Some(ScrollBinding(scroll.clone()));
+                            }
+                        }
+                        None => element_state.scroll_binding = None,
+                    }
                 }
 
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
@@ -2404,7 +2420,7 @@ impl Interactivity {
             || self.window_control.is_some()
             || style.mouse_cursor.is_some()
             || self.group.is_some()
-            || self.scroll_offset.is_some()
+            || self.scroll_state.is_some()
             || self.tracked_focus_handle.is_some()
             || self.hover_style.is_some()
             || self.group_hover_style.is_some()
@@ -2438,7 +2454,12 @@ impl Interactivity {
             (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
         }
 
-        if let Some(scroll_offset) = self.scroll_offset.as_ref() {
+        if let Some(scroll) = self.scroll_state.as_ref() {
+            if style.display == Display::None || style.visibility == Visibility::Hidden {
+                let mut scroll = scroll.borrow_mut();
+                scroll.cancel_motion();
+                return scroll.offset;
+            }
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
                 .tracked_scroll_handle
@@ -2469,23 +2490,23 @@ impl Interactivity {
             let scroll_max = Point::from(padded_content_size - bounds.size)
                 .map(round_to_two_decimals)
                 .max(&Default::default());
-            // Clamp scroll offset in case scroll max is smaller now (e.g., if children
-            // were removed or the bounds became larger).
-            let mut scroll_offset = scroll_offset.borrow_mut();
-
-            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+            let mut scroll = scroll.borrow_mut();
+            scroll.update_range(scroll_max);
             if scroll_to_bottom {
-                scroll_offset.y = -scroll_max.y;
-            } else {
-                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
+                let position = point(scroll.offset.x, -scroll_max.y);
+                scroll.set_offset(position);
+            }
+            let at = window.frame_time();
+            scroll.sample(at);
+            if scroll.is_active(at) {
+                window.request_animation_frame();
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
-                scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
             }
 
-            *scroll_offset
+            scroll.offset
         } else {
             Point::default()
         }
@@ -3324,7 +3345,23 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        if let Some(scroll_offset) = self.scroll_offset.clone() {
+        if let Some(scroll_state) = self.scroll_state.clone() {
+            let pointer_scroll = scroll_state.clone();
+            let pointer_hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture
+                    && pointer_hitbox.bounds.contains(&event.position)
+                    && pointer_hitbox.content_mask.bounds.contains(&event.position)
+                {
+                    pointer_scroll.borrow_mut().cancel_motion();
+                }
+            });
+            let keyboard_scroll = scroll_state.clone();
+            window.on_key_event(move |_: &KeyDownEvent, phase, _, _| {
+                if phase == DispatchPhase::Capture {
+                    keyboard_scroll.borrow_mut().cancel_motion();
+                }
+            });
             let ongoing_scroll = self.ongoing_scroll.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
@@ -3334,8 +3371,6 @@ impl Interactivity {
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                    let mut scroll_offset = scroll_offset.borrow_mut();
-                    let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
 
                     if restrict_scroll_to_axis
@@ -3372,9 +3407,12 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    let now = cx.background_executor().now();
+                    if scroll_state.borrow_mut().wheel(
+                        point(delta_x, delta_y),
+                        event.delta.precise(),
+                        now,
+                    ) {
                         cx.notify(current_view);
                     }
                 }
@@ -3616,10 +3654,26 @@ pub struct InteractiveElementState {
     /// press (mirroring the browser clearing a control's pressed state on
     /// blur). `None` means no activation key is pending.
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
-    pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    scroll_binding: Option<ScrollBinding>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+}
+
+impl InteractiveElementState {
+    pub(crate) fn cancel_scroll_motion(&mut self) {
+        if let Some(binding) = &self.scroll_binding {
+            binding.0.borrow_mut().cancel_motion();
+        }
+    }
+}
+
+struct ScrollBinding(Rc<RefCell<NativeScrollState>>);
+
+impl Drop for ScrollBinding {
+    fn drop(&mut self) {
+        self.0.borrow_mut().cancel_motion();
+    }
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -4203,6 +4257,7 @@ impl ScrollAnchor {
     }
     /// Request scroll to this item on the next frame.
     pub fn scroll_to(&self, window: &mut Window, _cx: &mut App) {
+        self.handle.cancel_scroll_motion();
         let this = self.clone();
 
         window.on_next_frame(move |_, _| {
@@ -4214,11 +4269,125 @@ impl ScrollAnchor {
 }
 
 #[derive(Default, Debug)]
+pub(crate) struct NativeScrollState {
+    offset: Point<Pixels>,
+    max_offset: Point<Pixels>,
+    wheel: [crate::WheelMotion; 2],
+}
+
+impl NativeScrollState {
+    pub(crate) fn offset(&self) -> Point<Pixels> {
+        self.offset
+    }
+
+    pub(crate) fn set_offset(&mut self, position: Point<Pixels>) {
+        self.cancel_motion();
+        self.offset = position;
+    }
+
+    pub(crate) fn constrain_offset(&mut self, position: Point<Pixels>) {
+        if position.x != self.offset.x {
+            self.wheel[0].cancel();
+        }
+        if position.y != self.offset.y {
+            self.wheel[1].cancel();
+        }
+        self.offset = position;
+    }
+
+    fn cancel_motion(&mut self) {
+        for motion in &mut self.wheel {
+            motion.cancel();
+        }
+    }
+
+    fn update_range(&mut self, range: Point<Pixels>) {
+        let [horizontal, vertical] = &mut self.wheel;
+        for (offset, limit, previous, motion) in [
+            (&mut self.offset.x, range.x, self.max_offset.x, horizontal),
+            (&mut self.offset.y, range.y, self.max_offset.y, vertical),
+        ] {
+            let position = f32::from(*offset);
+            let minimum = -f32::from(limit);
+            let clamped = position.clamp(minimum, 0.0);
+            let target = position + motion.unconsumed_target();
+            if position != clamped || (limit != previous && (target < minimum || target > 0.0)) {
+                motion.cancel();
+            }
+            *offset = px(clamped);
+        }
+        self.max_offset = range;
+    }
+
+    fn sample(&mut self, at: Instant) {
+        let [horizontal, vertical] = &mut self.wheel;
+        for (offset, limit, motion) in [
+            (&mut self.offset.x, self.max_offset.x, horizontal),
+            (&mut self.offset.y, self.max_offset.y, vertical),
+        ] {
+            let position = f32::from(*offset) + motion.take_delta(at);
+            let clamped = position.clamp(-f32::from(limit), 0.0);
+            if position != clamped {
+                motion.cancel();
+            }
+            *offset = px(clamped);
+        }
+    }
+
+    fn is_active(&self, at: Instant) -> bool {
+        self.wheel.iter().any(|motion| motion.is_active(at))
+    }
+
+    fn wheel(&mut self, delta: Point<Pixels>, precise: bool, at: Instant) -> bool {
+        if precise {
+            let interrupted = self
+                .wheel
+                .iter()
+                .any(|motion| motion.unconsumed_target() != 0.0);
+            let before = self.offset;
+            self.set_offset(before + delta);
+            return interrupted || self.offset != before;
+        }
+        let [horizontal, vertical] = &mut self.wheel;
+        let changed_x = Self::wheel_axis(self.offset.x, self.max_offset.x, horizontal, delta.x, at);
+        let changed_y = Self::wheel_axis(self.offset.y, self.max_offset.y, vertical, delta.y, at);
+        changed_x || changed_y
+    }
+
+    fn wheel_axis(
+        offset: Pixels,
+        limit: Pixels,
+        motion: &mut crate::WheelMotion,
+        delta: Pixels,
+        at: Instant,
+    ) -> bool {
+        let delta = f32::from(delta);
+        if delta == 0.0 {
+            return false;
+        }
+        let position = f32::from(offset);
+        let previous = motion.unconsumed_target();
+        let proposed = crate::WheelMotion::proposed_remaining(previous, delta);
+        let target = (position + proposed).clamp(-f32::from(limit), 0.0);
+        if target == position + previous {
+            return false;
+        }
+        if previous * proposed < 0.0 {
+            // No frame consumed this travel: reversal starts at the actual
+            // offset, not at an elapsed sample that never reached the image.
+            motion.cancel();
+        }
+        let unconsumed = motion.unconsumed_target() - motion.remaining(at);
+        motion.retarget_remaining(target - position - unconsumed, at);
+        true
+    }
+}
+
+#[derive(Default, Debug)]
 struct ScrollHandleState {
-    offset: Rc<RefCell<Point<Pixels>>>,
+    scroll: Rc<RefCell<NativeScrollState>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
@@ -4258,18 +4427,18 @@ impl ScrollHandle {
 
     /// Get the current scroll offset.
     pub fn offset(&self) -> Point<Pixels> {
-        *self.0.borrow().offset.borrow()
+        self.0.borrow().scroll.borrow().offset
     }
 
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
-        self.0.borrow().max_offset
+        self.0.borrow().scroll.borrow().max_offset
     }
 
     /// Get the top child that's scrolled into view.
     pub fn top_item(&self) -> usize {
         let state = self.0.borrow();
-        let top = state.bounds.top() - state.offset.borrow().y;
+        let top = state.bounds.top() - state.scroll.borrow().offset.y;
 
         match state.child_bounds.binary_search_by(|bounds| {
             if top < bounds.top() {
@@ -4288,7 +4457,7 @@ impl ScrollHandle {
     /// Get the bottom child that's scrolled into view.
     pub fn bottom_item(&self) -> usize {
         let state = self.0.borrow();
-        let bottom = state.bounds.bottom() - state.offset.borrow().y;
+        let bottom = state.bounds.bottom() - state.scroll.borrow().offset.y;
 
         match state.child_bounds.binary_search_by(|bounds| {
             if bottom < bounds.top() {
@@ -4317,6 +4486,7 @@ impl ScrollHandle {
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     pub fn scroll_to_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.scroll.borrow_mut().cancel_motion();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::default(),
@@ -4327,6 +4497,7 @@ impl ScrollHandle {
     /// This scrolls the minimal amount to ensure that the child is the first visible element
     pub fn scroll_to_top_of_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.scroll.borrow_mut().cancel_motion();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::Top,
@@ -4345,7 +4516,8 @@ impl ScrollHandle {
 
         let active_item = match state.child_bounds.get(active_item.index) {
             Some(bounds) => {
-                let mut scroll_offset = state.offset.borrow_mut();
+                let mut scroll = state.scroll.borrow_mut();
+                let mut scroll_offset = scroll.offset;
 
                 match active_item.strategy {
                     ScrollStrategy::FirstVisible => {
@@ -4377,6 +4549,7 @@ impl ScrollHandle {
                         scroll_offset.x = state.bounds.right() - bounds.right();
                     }
                 }
+                scroll.set_offset(scroll_offset);
                 None
             }
             None => Some(active_item),
@@ -4387,15 +4560,20 @@ impl ScrollHandle {
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
         let mut state = self.0.borrow_mut();
+        state.scroll.borrow_mut().cancel_motion();
         state.scroll_to_bottom = true;
     }
 
     /// Set the offset explicitly. The offset is the distance from the top left of the
     /// parent container to the top left of the first child.
     /// As you scroll further down the offset becomes more negative.
-    pub fn set_offset(&self, mut position: Point<Pixels>) {
+    pub fn set_offset(&self, position: Point<Pixels>) {
         let state = self.0.borrow();
-        *state.offset.borrow_mut() = position;
+        state.scroll.borrow_mut().set_offset(position);
+    }
+
+    pub(crate) fn cancel_scroll_motion(&self) {
+        self.0.borrow().scroll.borrow_mut().cancel_motion();
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.
@@ -4406,7 +4584,7 @@ impl ScrollHandle {
         if let Some(child_bounds) = state.child_bounds.get(ix) {
             (
                 ix,
-                child_bounds.top() + state.offset.borrow().y - state.bounds.top(),
+                child_bounds.top() + state.scroll.borrow().offset.y - state.bounds.top(),
             )
         } else {
             (ix, px(0.))
@@ -4421,7 +4599,7 @@ impl ScrollHandle {
         if let Some(child_bounds) = state.child_bounds.get(ix) {
             (
                 ix,
-                child_bounds.bottom() + state.offset.borrow().y - state.bounds.bottom(),
+                child_bounds.bottom() + state.scroll.borrow().offset.y - state.bounds.bottom(),
             )
         } else {
             (ix, px(0.))
@@ -4431,6 +4609,605 @@ impl ScrollHandle {
     /// Get the count of children for scrollable item.
     pub fn children_count(&self) -> usize {
         self.0.borrow().child_bounds.len()
+    }
+}
+
+#[cfg(test)]
+mod native_scroll_tests {
+    use super::*;
+    use crate::{
+        AppContext as _, Context, InputEvent as _, ScrollDelta, TestAppContext,
+        UniformListScrollHandle, WindowHandle,
+    };
+    use std::ops::Range;
+
+    fn scroll(position: Point<Pixels>) -> NativeScrollState {
+        let mut scroll = NativeScrollState::default();
+        scroll.update_range(point(px(1000.0), px(1000.0)));
+        scroll.set_offset(position);
+        scroll
+    }
+
+    #[test]
+    fn lines_only_change_intent_until_the_frame_commits_real_position() {
+        let at = Instant::now();
+        let mut scroll = scroll(Point::default());
+        assert!(scroll.wheel(point(px(0.0), px(-120.0)), false, at));
+        assert_eq!(scroll.offset(), Point::default());
+        assert!(scroll.is_active(at));
+        scroll.sample(at + Duration::from_millis(60));
+        assert!(scroll.offset.y < px(0.0) && scroll.offset.y > px(-120.0));
+        scroll.sample(at + Duration::from_millis(151));
+        assert!((f32::from(scroll.offset.y) + 120.0).abs() < 0.001);
+        assert!(!scroll.is_active(at + Duration::from_millis(151)));
+    }
+
+    #[test]
+    fn appending_before_prepaint_does_not_lose_elapsed_travel() {
+        let at = Instant::now();
+        let mut scroll = scroll(Point::default());
+        scroll.wheel(point(px(0.0), px(-120.0)), false, at);
+        scroll.wheel(
+            point(px(0.0), px(-120.0)),
+            false,
+            at + Duration::from_millis(30),
+        );
+        assert_eq!(scroll.offset(), Point::default());
+        scroll.sample(at + Duration::from_millis(300));
+        assert!((f32::from(scroll.offset.y) + 240.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn reversal_drops_unconsumed_old_travel_even_if_its_curve_already_ended() {
+        let at = Instant::now();
+        for elapsed in [30, 200] {
+            let mut scroll = scroll(point(px(0.0), px(-300.0)));
+            scroll.wheel(point(px(0.0), px(-160.0)), false, at);
+            scroll.wheel(
+                point(px(0.0), px(20.0)),
+                false,
+                at + Duration::from_millis(elapsed),
+            );
+            assert_eq!(scroll.offset.y, px(-300.0));
+            scroll.sample(at + Duration::from_millis(elapsed + 151));
+            assert_eq!(scroll.offset.y, px(-280.0));
+        }
+    }
+
+    #[test]
+    fn reversing_one_axis_does_not_stop_the_other_axis() {
+        let at = Instant::now();
+        let mut scroll = scroll(point(px(-300.0), px(-300.0)));
+        scroll.wheel(point(px(-100.0), px(-100.0)), false, at);
+        let turn = at + Duration::from_millis(30);
+        scroll.sample(turn);
+        let x = scroll.offset.x;
+        scroll.wheel(point(px(20.0), px(0.0)), false, turn);
+        assert!(scroll.wheel[1].is_active(turn));
+        scroll.sample(turn + Duration::from_millis(151));
+        assert!((f32::from(scroll.offset.x - x) - 20.0).abs() < 0.001);
+        assert!((f32::from(scroll.offset.y) + 400.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn direct_position_and_pixels_cancel_without_delivering_old_goals() {
+        let at = Instant::now();
+        let mut scroll = scroll(point(px(0.0), px(-300.0)));
+        scroll.wheel(point(px(0.0), px(-120.0)), false, at);
+        scroll.set_offset(point(px(0.0), px(-300.0)));
+        assert!(!scroll.is_active(at));
+        scroll.wheel(point(px(0.0), px(-120.0)), false, at);
+        scroll.wheel(
+            point(px(0.0), px(-7.0)),
+            true,
+            at + Duration::from_millis(60),
+        );
+        assert_eq!(scroll.offset.y, px(-307.0));
+        scroll.sample(at + Duration::from_millis(300));
+        assert_eq!(scroll.offset.y, px(-307.0));
+        assert!(!scroll.is_active(at + Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn a_shrinking_range_rejects_only_the_invalid_axis_goal() {
+        let at = Instant::now();
+        let mut scroll = scroll(point(px(-300.0), px(-300.0)));
+        scroll.wheel(point(px(-200.0), px(-200.0)), false, at);
+        scroll.update_range(point(px(1000.0), px(450.0)));
+        scroll.sample(at + Duration::from_millis(300));
+        assert_eq!(scroll.offset.x, px(-500.0));
+        assert_eq!(scroll.offset.y, px(-300.0));
+        scroll.update_range(point(px(1000.0), px(200.0)));
+        assert_eq!(scroll.offset.y, px(-200.0));
+    }
+
+    #[test]
+    fn refused_and_unchanged_edge_goals_do_not_start_or_extend_motion() {
+        let at = Instant::now();
+        let mut scroll = scroll(Point::default());
+        scroll.update_range(point(px(0.0), px(120.0)));
+        assert!(!scroll.wheel(point(px(0.0), px(20.0)), false, at));
+        assert!(!scroll.wheel(point(px(0.0), px(-0.0)), false, at));
+        assert!(!scroll.is_active(at));
+        scroll.wheel(point(px(0.0), px(-120.0)), false, at);
+        assert!(!scroll.wheel(
+            point(px(0.0), px(-120.0)),
+            false,
+            at + Duration::from_millis(100),
+        ));
+        scroll.sample(at + Duration::from_millis(151));
+        assert_eq!(scroll.offset.y, px(-120.0));
+        assert!(!scroll.is_active(at + Duration::from_millis(151)));
+    }
+
+    #[test]
+    fn releasing_a_binding_keeps_actual_position_and_discards_only_motion() {
+        let at = Instant::now();
+        let scroll = Rc::new(RefCell::new(scroll(point(px(0.0), px(-300.0)))));
+        let binding = ScrollBinding(scroll.clone());
+        scroll
+            .borrow_mut()
+            .wheel(point(px(0.0), px(-120.0)), false, at);
+        scroll.borrow_mut().sample(at + Duration::from_millis(30));
+        let position = scroll.borrow().offset();
+        drop(binding);
+        scroll.borrow_mut().sample(at + Duration::from_millis(300));
+        assert_eq!(scroll.borrow().offset(), position);
+        assert!(!scroll.borrow().is_active(at));
+    }
+
+    struct SurfaceView {
+        plain: ScrollHandle,
+        list: UniformListScrollHandle,
+        uniform: bool,
+        mounted: bool,
+        passive: bool,
+        count: usize,
+        height: Pixels,
+        focus: FocusHandle,
+        range: Rc<RefCell<Range<usize>>>,
+        clicked: Rc<Cell<Option<usize>>>,
+    }
+
+    fn row(index: usize, clicked: Rc<Cell<Option<usize>>>) -> Stateful<Div> {
+        div()
+            .id(("native-scroll-row", index))
+            .h(px(30.0))
+            .w_full()
+            .flex_none()
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, move |_, _, _| clicked.set(Some(index)))
+    }
+
+    impl Render for SurfaceView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let root = div().size_full().line_height(px(20.0));
+            if !self.mounted {
+                return root.into_any_element();
+            }
+            let surface = if self.passive {
+                let offset = if self.uniform {
+                    self.list.0.borrow().base_handle.offset()
+                } else {
+                    self.plain.offset()
+                };
+                div()
+                    .id("native-scroll-surface")
+                    .w(px(240.0))
+                    .h(self.height)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .relative()
+                            .top(offset.y)
+                            .h(px(self.count as f32 * 30.0)),
+                    )
+                    .into_any_element()
+            } else if self.uniform {
+                let range_seen = self.range.clone();
+                let clicked = self.clicked.clone();
+                crate::uniform_list("native-scroll-surface", self.count, move |range, _, _| {
+                    *range_seen.borrow_mut() = range.clone();
+                    range.map(|index| row(index, clicked.clone())).collect()
+                })
+                .w(px(240.0))
+                .h(self.height)
+                .track_focus(&self.focus)
+                .track_scroll(&self.list)
+                .into_any_element()
+            } else {
+                div()
+                    .id("native-scroll-surface")
+                    .w(px(240.0))
+                    .h(self.height)
+                    .flex()
+                    .flex_col()
+                    .track_focus(&self.focus)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.plain)
+                    .children((0..self.count).map(|index| row(index, self.clicked.clone())))
+                    .into_any_element()
+            };
+            root.child(surface).into_any_element()
+        }
+    }
+
+    fn surface(
+        cx: &mut TestAppContext,
+        uniform: bool,
+    ) -> (
+        WindowHandle<SurfaceView>,
+        ScrollHandle,
+        Rc<RefCell<Range<usize>>>,
+        Rc<Cell<Option<usize>>>,
+    ) {
+        let plain = ScrollHandle::new();
+        let list = UniformListScrollHandle::new();
+        let handle = if uniform {
+            list.0.borrow().base_handle.clone()
+        } else {
+            plain.clone()
+        };
+        let range = Rc::new(RefCell::new(0..0));
+        let clicked = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let range = range.clone();
+            let clicked = clicked.clone();
+            move |window, cx| {
+                let focus = cx.focus_handle();
+                window.focus(&focus, cx);
+                SurfaceView {
+                    plain,
+                    list,
+                    uniform,
+                    mounted: true,
+                    passive: false,
+                    count: 32,
+                    height: px(120.0),
+                    focus,
+                    range,
+                    clicked,
+                }
+            }
+        });
+        (window, handle, range, clicked)
+    }
+
+    fn paint<V: Render>(cx: &mut TestAppContext, window: WindowHandle<V>) {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx)
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+
+    fn wheel_event<V: Render>(
+        cx: &mut TestAppContext,
+        window: WindowHandle<V>,
+        delta: ScrollDelta,
+    ) {
+        cx.update_window(window.into(), |_, window, cx| {
+            let position = point(px(15.0), px(45.0));
+            window.simulate_mouse_move(position, cx);
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta,
+                    modifiers: Default::default(),
+                    touch_phase: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn native_containers_commit_offset_before_virtualization_and_pointer_hit(
+        cx: &mut TestAppContext,
+    ) {
+        for uniform in [false, true] {
+            let (window, handle, range, clicked) = surface(cx, uniform);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            assert_eq!(handle.offset().y, px(0.0));
+            paint(cx, window);
+            cx.background_executor
+                .advance_clock(Duration::from_millis(30));
+            paint(cx, window);
+            let offset = f32::from(handle.offset().y);
+            assert!(offset < 0.0 && offset > -240.0);
+            if uniform {
+                assert_eq!(range.borrow().start, (-offset / 30.0).floor() as usize);
+                assert!(
+                    range.borrow().len() < 32,
+                    "only the visible band is materialized"
+                );
+            }
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(15.0), px(45.0)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+            assert_eq!(
+                clicked.get(),
+                Some(((45.0 - offset) / 30.0).floor() as usize)
+            );
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            paint(cx, window);
+            assert_eq!(
+                f32::from(handle.offset().y),
+                offset,
+                "the click stopped the glide"
+            );
+            let count = cx
+                .update_window(window.into(), |_, window, cx| {
+                    window.simulate_next_frame(cx)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "no idle native frame loop");
+        }
+    }
+
+    #[gpui::test]
+    fn native_direct_item_requests_and_pixels_take_over_without_delayed_motion(
+        cx: &mut TestAppContext,
+    ) {
+        for uniform in [false, true] {
+            let (window, handle, _, _) = surface(cx, uniform);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            window
+                .update(cx, |view, _, cx| {
+                    if uniform {
+                        view.list.scroll_to_item(0, crate::ScrollStrategy::Nearest);
+                    } else {
+                        view.plain.scroll_to_item(0);
+                    }
+                    cx.notify();
+                })
+                .unwrap();
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            paint(cx, window);
+            assert_eq!(handle.offset().y, px(0.0));
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            wheel_event(cx, window, ScrollDelta::Pixels(point(px(0.0), px(-17.0))));
+            paint(cx, window);
+            assert_eq!(handle.offset().y, px(-17.0));
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            paint(cx, window);
+            assert_eq!(handle.offset().y, px(-17.0));
+        }
+    }
+
+    #[gpui::test]
+    fn native_passive_and_unmounted_surfaces_keep_position_without_a_stale_goal(
+        cx: &mut TestAppContext,
+    ) {
+        for passive in [false, true] {
+            let (window, handle, _, _) = surface(cx, true);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            cx.background_executor
+                .advance_clock(Duration::from_millis(30));
+            paint(cx, window);
+            let position = handle.offset();
+            window
+                .update(cx, |view, _, cx| {
+                    view.passive = passive;
+                    view.mounted = passive;
+                    cx.notify();
+                })
+                .unwrap();
+            paint(cx, window);
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            window
+                .update(cx, |view, _, cx| {
+                    view.passive = false;
+                    view.mounted = true;
+                    cx.notify();
+                })
+                .unwrap();
+            paint(cx, window);
+            assert_eq!(handle.offset(), position);
+        }
+    }
+
+    #[gpui::test]
+    fn native_lifecycle_without_an_intermediate_draw_cancels_old_motion(cx: &mut TestAppContext) {
+        for hidden in [false, true] {
+            let (window, handle, _, _) = surface(cx, true);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            cx.background_executor
+                .advance_clock(Duration::from_millis(30));
+            paint(cx, window);
+            let position = handle.offset();
+            let platform = cx.test_window(window.into());
+            if hidden {
+                platform.simulate_visibility_change(crate::WindowVisibility::Hidden);
+            } else {
+                platform.simulate_active_status_change(false);
+            }
+            cx.run_until_parked();
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            if hidden {
+                platform.simulate_visibility_change(crate::WindowVisibility::Visible);
+            } else {
+                platform.simulate_active_status_change(true);
+            }
+            cx.run_until_parked();
+            paint(cx, window);
+            assert_eq!(handle.offset(), position);
+        }
+    }
+
+    #[gpui::test]
+    fn native_keyboard_input_cancels_motion_without_consuming_the_key(cx: &mut TestAppContext) {
+        for uniform in [false, true] {
+            let (window, handle, _, _) = surface(cx, uniform);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            cx.background_executor
+                .advance_clock(Duration::from_millis(30));
+            paint(cx, window);
+            let position = handle.offset();
+            cx.update_window(window.into(), |_, window, cx| {
+                let result = window.dispatch_event(
+                    KeyDownEvent {
+                        keystroke: crate::Keystroke::parse("down").unwrap(),
+                        is_held: false,
+                        prefer_character_input: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert!(
+                    result.propagate,
+                    "motion cancellation does not own key semantics"
+                );
+            })
+            .unwrap();
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            paint(cx, window);
+            assert_eq!(handle.offset(), position);
+        }
+    }
+
+    #[gpui::test]
+    fn native_resize_and_content_shrink_clamp_the_same_handle_before_list_materialization(
+        cx: &mut TestAppContext,
+    ) {
+        for uniform in [false, true] {
+            let (window, handle, range, _) = surface(cx, uniform);
+            handle.set_offset(point(px(0.0), px(-500.0)));
+            paint(cx, window);
+            wheel_event(cx, window, ScrollDelta::Lines(point(0.0, -12.0)));
+            window
+                .update(cx, |view, _, cx| {
+                    view.count = 20;
+                    view.height = px(240.0);
+                    cx.notify();
+                })
+                .unwrap();
+            paint(cx, window);
+            assert_eq!(handle.max_offset().y, px(360.0));
+            assert_eq!(handle.offset().y, px(-360.0));
+            if uniform {
+                assert_eq!(*range.borrow(), 12..20);
+            }
+            cx.background_executor
+                .advance_clock(Duration::from_millis(200));
+            paint(cx, window);
+            assert_eq!(handle.offset().y, px(-360.0));
+        }
+    }
+
+    #[gpui::test]
+    fn native_untracked_div_uses_its_element_binding_for_finite_scroll(cx: &mut TestAppContext) {
+        struct UntrackedView;
+        impl Render for UntrackedView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().line_height(px(20.0)).child(
+                    div()
+                        .id("untracked-scroll")
+                        .w(px(240.0))
+                        .h(px(120.0))
+                        .overflow_y_scroll()
+                        .child(div().h(px(960.0))),
+                )
+            }
+        }
+        let window = cx.add_window(|_, _| UntrackedView);
+        let scroll = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window
+                    .rendered_frame
+                    .element_states
+                    .values()
+                    .find_map(|state| {
+                        state
+                            .inner
+                            .downcast_ref::<Option<InteractiveElementState>>()
+                            .and_then(Option::as_ref)
+                            .and_then(|state| state.scroll_binding.as_ref())
+                            .map(|binding| binding.0.clone())
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let position = point(px(15.0), px(45.0));
+            window.simulate_mouse_move(position, cx);
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -6.0)),
+                    modifiers: Default::default(),
+                    touch_phase: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(scroll.borrow().offset().y, px(0.0));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(151));
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(scroll.borrow().offset().y, px(-120.0));
+    }
+
+    #[gpui::test]
+    fn native_two_axis_events_and_separate_windows_keep_their_own_position(
+        cx: &mut TestAppContext,
+    ) {
+        struct TwoAxisView(ScrollHandle);
+        impl Render for TwoAxisView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut element = div()
+                    .id("two-axis")
+                    .size(px(120.0))
+                    .overflow_scroll()
+                    .track_scroll(&self.0)
+                    .child(div().size(px(1000.0)));
+                element.style().allow_concurrent_scroll = Some(true);
+                div().size_full().line_height(px(20.0)).child(element)
+            }
+        }
+        let handles = [ScrollHandle::new(), ScrollHandle::new()];
+        let windows = handles.each_ref().map(|handle| {
+            handle.set_offset(point(px(-100.0), px(-100.0)));
+            cx.add_window(|_, _| TwoAxisView(handle.clone()))
+        });
+        wheel_event(cx, windows[0], ScrollDelta::Lines(point(-3.0, -4.0)));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(30));
+        paint(cx, windows[0]);
+        let partial = handles[0].offset();
+        assert!(partial.x < px(-100.0) && partial.y < px(-100.0));
+        wheel_event(cx, windows[0], ScrollDelta::Lines(point(1.0, 0.0)));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(200));
+        paint(cx, windows[0]);
+        paint(cx, windows[1]);
+        assert!((f32::from(handles[0].offset().x - partial.x) - 20.0).abs() < 0.001);
+        assert_eq!(handles[0].offset().y, px(-180.0));
+        assert_eq!(handles[1].offset(), point(px(-100.0), px(-100.0)));
     }
 }
 

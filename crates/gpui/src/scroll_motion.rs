@@ -60,27 +60,39 @@ impl WheelMotion {
             .map_or(0.0, |motion| motion.target() - motion.presented(at))
     }
 
-    /// Aim at an accepted remaining displacement, rebased on the current image.
+    /// The total displacement still owed to an incremental consumer, including
+    /// elapsed travel that has not yet been delivered by [`Self::take_delta`].
+    pub fn unconsumed_target(&self) -> f32 {
+        self.motion.as_ref().map_or(0.0, Motion::target)
+    }
+
+    /// Aim at an accepted remaining displacement from the current sample.
     /// Same-direction changes retain speed; reversal starts from rest. An
-    /// unchanged goal does not renew the response's terminal instant.
+    /// unchanged goal does not renew the response's terminal instant. Elapsed
+    /// but unconsumed travel stays in the curve until its consumer takes it.
     pub fn retarget_remaining(&mut self, remaining: f32, at: Instant) {
-        if remaining == 0.0 {
-            self.cancel();
-            return;
-        }
         let previous = self.remaining(at);
         if remaining == previous {
+            return;
+        }
+        let presented = self
+            .motion
+            .as_ref()
+            .map_or(0.0, |motion| motion.presented(at));
+        if remaining == 0.0 {
+            self.motion =
+                (presented != 0.0).then(|| Motion::start(presented, presented, at, Duration::ZERO));
             return;
         }
         match &mut self.motion {
             Some(motion) if previous * remaining > 0.0 => {
                 let duration = wheel_retarget_duration(remaining, motion.speed(at));
-                motion.reaim(0.0, remaining, at, duration);
+                motion.reaim(presented, presented + remaining, at, duration);
             }
             _ => {
                 self.motion = Some(Motion::start(
-                    0.0,
-                    remaining,
+                    presented,
+                    presented + remaining,
                     at,
                     wheel_glide_duration(remaining),
                 ));
@@ -306,5 +318,37 @@ mod tests {
         assert_eq!(motion.take_delta(base + Duration::from_secs(1)), 0.0);
         assert_eq!(motion.remaining(base), 0.0);
         assert!(!motion.is_active(base));
+    }
+
+    #[test]
+    fn retargeting_before_a_frame_keeps_elapsed_but_unconsumed_travel() {
+        let base = Instant::now();
+        let at = base + Duration::from_millis(30);
+        let mut motion = WheelMotion::default();
+        motion.retarget_remaining(120.0, base);
+        let remaining = motion.remaining(at);
+        let elapsed = motion.unconsumed_target() - remaining;
+        let speed = motion.speed(at);
+        motion.retarget_remaining(remaining + 60.0, at);
+        assert!((motion.unconsumed_target() - 180.0).abs() < 0.001);
+        assert!((motion.speed(at) - speed).abs() < speed * 0.01);
+        let delivered = motion.take_delta(at);
+        assert!((delivered - elapsed).abs() < 0.001);
+        let last = motion.take_delta(at + wheel_glide_duration(0.0));
+        assert!((delivered + last - 180.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn accepting_zero_remaining_still_delivers_already_elapsed_travel() {
+        let base = Instant::now();
+        let at = base + Duration::from_millis(30);
+        let mut motion = WheelMotion::default();
+        motion.retarget_remaining(120.0, base);
+        let elapsed = motion.unconsumed_target() - motion.remaining(at);
+        motion.retarget_remaining(0.0, at);
+        assert!(!motion.is_active(at));
+        assert_eq!(motion.remaining(at), 0.0);
+        assert!((motion.take_delta(at) - elapsed).abs() < 0.001);
+        assert_eq!(motion.take_delta(at), 0.0);
     }
 }
