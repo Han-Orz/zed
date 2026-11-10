@@ -190,11 +190,12 @@ impl DirectWriteTextSystem {
             system_subpixel_rendering,
         };
 
+        // Missing families force a refresh on lookup, so startup can use the system cache.
         let system_font_collection = unsafe {
             let mut result = None;
             components
                 .factory
-                .GetSystemFontCollection(false, &mut result, true)?;
+                .GetSystemFontCollection(false, &mut result, false)?;
             result.context("Failed to get system font collection")?
         };
         let custom_font_set = unsafe { components.builder.CreateFontSet()? };
@@ -2003,6 +2004,40 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn font_lookup_refreshes_stale_system_font_collection() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let text_system = DirectWriteTextSystem::new(&devices)?;
+        let empty_font_set = unsafe { text_system.components.builder.CreateFontSet()? };
+        let empty_collection = unsafe {
+            text_system
+                .components
+                .factory
+                .CreateFontCollectionFromFontSet(&empty_font_set)?
+        };
+        text_system.state.write().system_font_collection = empty_collection;
+        assert!(
+            !text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == "Segoe UI")
+        );
+
+        let font = Font {
+            family: "Segoe UI".into(),
+            ..Default::default()
+        };
+        let font_id = text_system.font_id(&font)?;
+        assert!(
+            text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == "Segoe UI")
+        );
+        assert_eq!(text_system.font_id(&font)?, font_id);
+        Ok(())
     }
 
     #[test]
