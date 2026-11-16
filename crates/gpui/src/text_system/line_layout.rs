@@ -568,9 +568,12 @@ impl LineLayoutCache {
                 if !glyphs.peek().is_some_and(|glyph| glyph.index == byte) {
                     return None;
                 }
-                let font_id = layout.font_id_for_index(ideograph)?;
-                let advance = *advance.get_or_insert_with(|| {
-                    self.platform_text_system
+                let spacing_advance = if let Some(advance) = advance {
+                    advance
+                } else {
+                    let font_id = layout.font_id_for_index(ideograph)?;
+                    let measured = self
+                        .platform_text_system
                         .layout_line(
                             "水",
                             layout.font_size,
@@ -581,9 +584,14 @@ impl LineLayoutCache {
                             }],
                         )
                         .width
-                        / 8.
-                });
-                Some(Spacing { byte, advance })
+                        / 8.;
+                    advance = Some(measured);
+                    measured
+                };
+                Some(Spacing {
+                    byte,
+                    advance: spacing_advance,
+                })
             })
             .collect()
     }
