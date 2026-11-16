@@ -7544,6 +7544,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "ttf-parser",
+ "unicode-linebreak",
  "unicode-segmentation",
  "url",
  "usvg",

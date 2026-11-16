@@ -1,6 +1,8 @@
 use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
-use std::{borrow::Cow, iter, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
+
+use super::line_breaks::{self, BreakKind, BreakPoint};
 
 /// Determines whether to truncate text from the start or end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,97 +44,75 @@ impl LineWrapper {
         fragments: &'a [LineFragment],
         wrap_width: Pixels,
     ) -> impl Iterator<Item = Boundary> + 'a {
+        // Elements participate in Unicode context as U+FFFC. Their caller-owned
+        // byte lengths still determine returned boundaries, not the placeholder.
+        let text = match fragments {
+            [LineFragment::Text { text }] => Cow::Borrowed(*text),
+            _ => Cow::Owned(
+                fragments
+                    .iter()
+                    .map(|fragment| match fragment {
+                        LineFragment::Text { text } => *text,
+                        LineFragment::Element { .. } => "\u{fffc}",
+                    })
+                    .collect::<String>(),
+            ),
+        };
+        let mut opportunities = line_breaks::opportunities(&text).peekable();
         let mut width = px(0.);
-        let mut first_non_whitespace_ix = None;
-        let mut indent = None;
-        let mut last_candidate_ix = 0;
-        let mut last_candidate_width = px(0.);
-        let mut last_wrap_ix = 0;
-        let mut prev_c = '\0';
-        let mut index = 0;
-        let mut candidates = fragments
+        let mut byte = 0;
+        let mut context_byte = 0;
+        let mut first_non_whitespace = None;
+        let mut points = Vec::new();
+        for candidate in fragments
             .iter()
-            .flat_map(move |fragment| fragment.wrap_boundary_candidates())
-            .peekable();
-        iter::from_fn(move || {
-            for candidate in candidates.by_ref() {
-                let ix = index;
-                index += candidate.len_utf8();
-                let mut new_prev_c = prev_c;
-                let item_width = match candidate {
-                    WrapBoundaryCandidate::Char { character: c } => {
-                        if c == '\n' {
-                            continue;
-                        }
-
-                        if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        }
-
-                        if c != ' ' && first_non_whitespace_ix.is_none() {
-                            first_non_whitespace_ix = Some(ix);
-                        }
-
-                        new_prev_c = c;
-
-                        self.width_for_char(c)
-                    }
-                    WrapBoundaryCandidate::Element {
-                        width: element_width,
-                        ..
-                    } => {
-                        if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                            last_candidate_ix = ix;
-                            last_candidate_width = width;
-                        }
-
-                        if first_non_whitespace_ix.is_none() {
-                            first_non_whitespace_ix = Some(ix);
-                        }
-
-                        element_width
-                    }
-                };
-
-                width += item_width;
-                if width > wrap_width && ix > last_wrap_ix {
-                    if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
-                    {
-                        indent = Some(
-                            Self::MAX_INDENT.min((first_non_whitespace_ix - last_wrap_ix) as u32),
-                        );
-                    }
-
-                    if last_candidate_ix > 0 {
-                        last_wrap_ix = last_candidate_ix;
-                        width -= last_candidate_width;
-                        last_candidate_ix = 0;
-                    } else {
-                        last_wrap_ix = ix;
-                        width = item_width;
-                    }
-
-                    if let Some(indent) = indent {
-                        width += self.width_for_char(' ') * indent as f32;
-                    }
-
-                    return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
-                }
-
-                prev_c = new_prev_c;
+            .flat_map(LineFragment::wrap_boundary_candidates)
+        {
+            let candidate_length = candidate.len_utf8();
+            while opportunities
+                .peek()
+                .is_some_and(|&(index, _)| index < context_byte)
+            {
+                opportunities.next();
             }
-
-            None
-        })
+            if let Some(&(index, kind)) = opportunities.peek()
+                && index == context_byte
+                && kind != BreakKind::Prohibited
+            {
+                points.push(BreakPoint {
+                    byte,
+                    x: width,
+                    boundary: Some(byte),
+                    kind,
+                });
+            }
+            let (advance, context_length, non_whitespace) = match candidate {
+                WrapBoundaryCandidate::Char { character } => (
+                    self.width_for_char(character),
+                    character.len_utf8(),
+                    character != ' ',
+                ),
+                WrapBoundaryCandidate::Element { width, .. } => {
+                    (width, '\u{fffc}'.len_utf8(), true)
+                }
+            };
+            if non_whitespace && first_non_whitespace.is_none() {
+                first_non_whitespace =
+                    Some((byte, width, self.width_for_char(' '), Self::MAX_INDENT));
+            }
+            width += advance;
+            byte += candidate_length;
+            context_byte += context_length;
+        }
+        points.push(BreakPoint {
+            byte,
+            x: width,
+            boundary: None,
+            kind: BreakKind::Normal,
+        });
+        line_breaks::fit(&points, wrap_width, first_non_whitespace, usize::MAX)
+            .into_iter()
+            .map(|(byte, indent)| Boundary::new(byte, indent))
     }
 
     /// Determines if a line should be truncated based on its width.
@@ -301,10 +281,8 @@ impl LineWrapper {
     /// Truncate text to fit within a given number of wrapped lines.
     ///
     /// Unlike `truncate_line` which treats the text as a flat width budget
-    /// (`width * max_lines`), this method accounts for word-boundary wrapping:
-    /// it walks through characters once, tracking wrap boundaries and the
-    /// truncation point simultaneously. When text overflows on the last
-    /// allowed line, it truncates there and appends the affix.
+    /// (`width * max_lines`), this uses the same Unicode wrapping as `wrap_line`
+    /// to locate the final visible row, then truncates only that row.
     ///
     /// For `max_lines == 1`, this delegates to `truncate_line`.
     pub fn truncate_wrapped_line<'a>(
@@ -329,164 +307,42 @@ impl LineWrapper {
             return self.truncate_line(text, wrap_width, truncation_affix, runs, truncate_from);
         }
 
-        let affix_width: Pixels = truncation_affix
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .sum();
-
-        let mut width = px(0.);
-        let mut line = 0usize;
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = 0usize;
-        let mut last_candidate_width = px(0.);
-        let mut last_wrap_ix = 0usize;
-        let mut prev_c = '\0';
-        let mut indent: Option<u32> = None;
-        let mut truncate_ix = 0usize;
-
-        for (ix, c) in text.char_indices() {
-            if c == '\n' {
-                if line >= max_lines - 1 && !text[ix + 1..].trim().is_empty() {
-                    // Newline on the last allowed line with real content
-                    // below. Truncate here.
-                    let truncated = text[..truncate_ix]
-                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
-                    let result = SharedString::from(format!("{truncated}{truncation_affix}"));
-                    let mut runs = runs.to_vec();
-                    update_runs_after_truncation(
-                        &result,
-                        truncation_affix,
-                        &mut runs,
-                        TruncateFrom::End,
-                    );
-                    return (result, Cow::Owned(runs));
+        let mut offset = 0;
+        let mut rows = 0;
+        for hard_line in text.split('\n') {
+            let fragments = [LineFragment::text(hard_line)];
+            let wraps: Vec<_> = self.wrap_line(&fragments, wrap_width).collect();
+            let row_count = wraps.len() + 1;
+            if rows + row_count >= max_lines {
+                let last_row = max_lines - rows - 1;
+                let (start, indent) = if last_row == 0 {
+                    (0, 0)
+                } else {
+                    (wraps[last_row - 1].ix, wraps[last_row - 1].next_indent)
+                };
+                let has_hidden_content = rows + row_count > max_lines
+                    || !text[offset + hard_line.len()..].trim().is_empty();
+                if !has_hidden_content {
+                    return (text, Cow::Borrowed(runs));
                 }
-
-                // Newline before the last line: it consumes a line.
-                line += 1;
-                width = px(0.);
-                first_non_whitespace_ix = None;
-                last_candidate_ix = 0;
-                last_candidate_width = px(0.);
-                last_wrap_ix = ix + 1;
-                prev_c = '\0';
-                indent = None;
-                truncate_ix = ix + 1;
-                continue;
+                let tail = SharedString::from(format!("{}{truncation_affix}", &hard_line[start..]));
+                let row_width = wrap_width - self.width_for_char(' ') * indent as f32;
+                let (tail, _) =
+                    self.truncate_line(tail, row_width, truncation_affix, &[], TruncateFrom::End);
+                let result = SharedString::from(format!("{}{}", &text[..offset + start], tail));
+                let mut runs = runs.to_vec();
+                update_runs_after_truncation(
+                    &result,
+                    truncation_affix,
+                    &mut runs,
+                    TruncateFrom::End,
+                );
+                return (result, Cow::Owned(runs));
             }
-
-            let char_width = self.width_for_char(c);
-
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = ix;
-                last_candidate_width = width;
-            }
-
-            if c != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(ix);
-            }
-
-            width += char_width;
-
-            if line < max_lines - 1 {
-                // Before the last line: replicate wrap_line's boundary logic.
-                if width > wrap_width && ix > last_wrap_ix {
-                    if let (None, Some(first_nw)) = (indent, first_non_whitespace_ix) {
-                        indent = Some(Self::MAX_INDENT.min((first_nw - last_wrap_ix) as u32));
-                    }
-
-                    if last_candidate_ix > last_wrap_ix {
-                        last_wrap_ix = last_candidate_ix;
-                        width -= last_candidate_width;
-                        last_candidate_ix = 0;
-                    } else {
-                        last_wrap_ix = ix;
-                        width = char_width;
-                    }
-
-                    if let Some(ind) = indent {
-                        width += self.width_for_char(' ') * ind as f32;
-                    }
-
-                    line += 1;
-                    truncate_ix = last_wrap_ix;
-                }
-            } else {
-                // On the last line: track the furthest point where the affix
-                // still fits, and stop as soon as the line overflows.
-                if width + affix_width <= wrap_width {
-                    truncate_ix = ix + c.len_utf8();
-                }
-
-                if width > wrap_width {
-                    let truncated = text[..truncate_ix]
-                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
-                    let result = SharedString::from(format!("{truncated}{truncation_affix}"));
-                    let mut runs = runs.to_vec();
-                    update_runs_after_truncation(
-                        &result,
-                        truncation_affix,
-                        &mut runs,
-                        TruncateFrom::End,
-                    );
-                    return (result, Cow::Owned(runs));
-                }
-            }
-
-            prev_c = c;
+            rows += row_count;
+            offset += hard_line.len() + 1;
         }
-
-        // Text fits within max_lines without truncation.
         (text, Cow::Borrowed(runs))
-    }
-
-    /// Any character in this list should be treated as a word character,
-    /// meaning it can be part of a word that should not be wrapped.
-    pub(crate) fn is_word_char(c: char) -> bool {
-        // ASCII alphanumeric characters, for English, numbers: `Hello123`, etc.
-        c.is_ascii_alphanumeric() ||
-        // Latin script in Unicode for French, German, Spanish, etc.
-        // Latin-1 Supplement
-        // https://en.wikipedia.org/wiki/Latin-1_Supplement
-        matches!(c, '\u{00C0}'..='\u{00FF}') ||
-        // Latin Extended-A
-        // https://en.wikipedia.org/wiki/Latin_Extended-A
-        matches!(c, '\u{0100}'..='\u{017F}') ||
-        // Latin Extended-B
-        // https://en.wikipedia.org/wiki/Latin_Extended-B
-        matches!(c, '\u{0180}'..='\u{024F}') ||
-        // Cyrillic for Russian, Ukrainian, etc.
-        // https://en.wikipedia.org/wiki/Cyrillic_script_in_Unicode
-        matches!(c, '\u{0400}'..='\u{04FF}') ||
-
-        // Vietnamese (https://vietunicode.sourceforge.net/charset/)
-        matches!(c, '\u{1E00}'..='\u{1EFF}') || // Latin Extended Additional
-        matches!(c, '\u{0300}'..='\u{036F}') || // Combining Diacritical Marks
-
-        // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
-        matches!(c, '\u{0980}'..='\u{09FF}') ||
-
-        // Some other known special characters that should be treated as word characters,
-        // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
-        // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
-        // is included so it stays attached to the preceding word when wrapping.
-        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
-        // Closing punctuation never starts a line (UAX #14 LB13: no break
-        // before `!`, `)`, `]`, `}`, closing quotes or an ellipsis) — `plz!`,
-        // `see)`, `quoted”` wrap as one word instead of orphaning the mark on
-        // the next line. `/` and `?` stay break opportunities so long paths
-        // and URLs (`a/b`, `foo?b=2`) can wrap.
-        matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…') ||
-        // `⋯` character is special used in Zed, to keep this at the end of the line.
-        matches!(c, '⋯') ||
-
-        // Non-breaking glue characters
-        matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
     }
 
     #[inline(always)]
@@ -847,7 +703,7 @@ mod tests {
             &[
                 Boundary::new(6, 0),
                 Boundary::new(11, 0),
-                Boundary::new(12, 0),
+                Boundary::new(13, 0), // UAX #14 keeps the following space with the element.
                 Boundary::new(18, 0)
             ],
         );
@@ -860,7 +716,7 @@ mod tests {
                     px(72.0)
                 )
                 .collect::<Vec<_>>(),
-            &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
+            &[Boundary::new(13, 0),], // UAX #14 breaks after the ordinary space, not before it.
         );
     }
 
@@ -1122,84 +978,27 @@ mod tests {
     }
 
     #[test]
-    fn test_is_word_char() {
-        #[track_caller]
-        fn assert_word(word: &str) {
-            for c in word.chars() {
-                assert!(
-                    LineWrapper::is_word_char(c),
-                    "assertion failed for '{}' (unicode 0x{:x})",
-                    c,
-                    c as u32
-                );
-            }
+    fn unicode_wrap_shares_context_across_fragments() {
+        let mut wrapper = build_wrapper();
+        let text = "甲（乙）丙，丁。e\u{301}👩‍👩‍👧‍👦";
+        let whole: Vec<_> = wrapper
+            .wrap_line(&[LineFragment::text(text)], px(30.))
+            .collect();
+        let fragments = [
+            LineFragment::text("甲（"),
+            LineFragment::text("乙）丙，丁。e"),
+            LineFragment::text("\u{301}👩‍👩‍👧‍👦"),
+        ];
+        let split: Vec<_> = wrapper.wrap_line(&fragments, px(30.)).collect();
+        assert_eq!(whole, split);
+        let graphemes: Vec<_> =
+            unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+                .map(|(byte, _)| byte)
+                .collect();
+        for boundary in whole {
+            assert!(graphemes.contains(&boundary.ix));
+            assert!(!text[boundary.ix..].starts_with(['）', '，', '。', '\u{301}', '\u{200d}']));
         }
-
-        #[track_caller]
-        fn assert_not_word(word: &str) {
-            let found = word.chars().any(|c| !LineWrapper::is_word_char(c));
-            assert!(found, "assertion failed for '{}'", word);
-        }
-
-        assert_word("Hello123");
-        assert_word("non-English");
-        assert_word("var_name");
-        assert_word("123456");
-        assert_word("3.1415");
-        assert_word("10^2");
-        assert_word("1~2");
-        assert_word("100%");
-        assert_word("@mention");
-        assert_word("#hashtag");
-        assert_word("$variable");
-        assert_word("a=1");
-        assert_word("Self::is_word_char");
-        assert_word("on;");
-        assert_word("more⋯");
-        assert_word("won’t");
-        assert_word("‘twas");
-        assert_word("plz!");
-        assert_word("see)");
-        assert_word("quoted”");
-        assert_word("well…");
-
-        // Space
-        assert_not_word("foo bar");
-
-        // URL case
-        assert_word("github.com");
-        assert_not_word("zed-industries/zed");
-        assert_not_word("zed-industries\\zed");
-        assert_not_word("a=1&b=2");
-        assert_not_word("foo?b=2");
-
-        // Latin-1 Supplement
-        assert_word("ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏ");
-        // Latin Extended-A
-        assert_word("ĀāĂăĄąĆćĈĉĊċČčĎď");
-        // Latin Extended-B
-        assert_word("ƀƁƂƃƄƅƆƇƈƉƊƋƌƍƎƏ");
-        // Cyrillic
-        assert_word("АБВГДЕЖЗИЙКЛМНОП");
-        // Vietnamese (https://github.com/zed-industries/zed/issues/23245)
-        assert_word("ThậmchíđếnkhithuachạychúngcònnhẫntâmgiếtnốtsốđôngtùchínhtrịởYênBáivàCaoBằng");
-        // Bengali
-        assert_word("গিয়েছিলেন");
-        assert_word("ছেলে");
-        assert_word("হচ্ছিল");
-
-        // non-word characters
-        assert_not_word("你好");
-        assert_not_word("안녕하세요");
-        assert_not_word("こんにちは");
-        assert_not_word("😀😁😂");
-        assert_not_word("()[]{}<>");
-
-        // Non-breaking ("Glue") characters, see https://www.unicode.org/reports/tr14/
-        // (https://github.com/zed-industries/zed/issues/59664)
-        assert_word("\u{202F}"); // NNBSP " "
-        assert_word("\u{00A0}"); // NBSP " "
-        assert_word("\u{2011}"); // NBH "‑"
     }
 
     // For compatibility with the test macro

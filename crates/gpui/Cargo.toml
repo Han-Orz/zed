@@ -86,6 +86,8 @@ scheduler.workspace = true
 resvg.workspace = true
 usvg.workspace = true
 ttf-parser = "0.25"
+unicode-linebreak = "0.1.5"
+unicode-segmentation.workspace = true
 util_macros.workspace = true
 schemars.workspace = true
 seahash = "4.1"
@@ -150,7 +152,6 @@ gpui_util = { workspace = true }
 lyon = { version = "1.0", features = ["extra"] }
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
-unicode-segmentation = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
