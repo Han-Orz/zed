@@ -508,6 +508,12 @@ pub trait Styled: Sized {
         &mut style.text
     }
 
+    /// Sets contextual inter-script spacing for descendant text.
+    fn text_autospace(mut self, spacing: crate::TextAutospace) -> Self {
+        self.text_style().text_autospace = Some(spacing);
+        self
+    }
+
     /// Sets the text color of this element.
     ///
     /// This value cascades to its child elements.

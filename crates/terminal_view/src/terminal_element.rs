@@ -913,6 +913,7 @@ impl TerminalElement {
         };
 
         let mut result = TextRun {
+            text_autospace: Default::default(),
             len: cell.character().len_utf8(),
             color: fg,
             background_color: None,

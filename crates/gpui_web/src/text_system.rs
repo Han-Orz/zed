@@ -397,6 +397,7 @@ impl PlatformTextSystem for WebTextSystem {
                 Cow::Owned(
                     runs.iter()
                         .map(|run| FontRun {
+                            text_autospace: run.text_autospace,
                             len: run.len,
                             font_id: self.native_font_id(run.font_id),
                         })

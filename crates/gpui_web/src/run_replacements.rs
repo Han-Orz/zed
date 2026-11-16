@@ -229,6 +229,7 @@ mod tests {
         let candidates = collect_candidates(
             text,
             &[FontRun {
+                text_autospace: Default::default(),
                 len: text.len(),
                 font_id: FontId(7),
             }],
@@ -266,10 +267,12 @@ mod tests {
         layout.runs[1].glyphs = vec![source_glyph(3, 10.0, 0, false)];
         let mut font_runs = [
             FontRun {
+                text_autospace: Default::default(),
                 len: 3,
                 font_id: FontId(7),
             },
             FontRun {
+                text_autospace: Default::default(),
                 len: 3,
                 font_id: FontId(7),
             },
@@ -302,6 +305,7 @@ mod tests {
         let candidates = collect_candidates(
             "中文",
             &[FontRun {
+                text_autospace: Default::default(),
                 len: 6,
                 font_id: FontId(7),
             }],
@@ -330,6 +334,7 @@ mod tests {
     fn candidates_preserve_native_coverage_and_color() -> Result<()> {
         let mut layout = layout(&[1]);
         let font_runs = [FontRun {
+            text_autospace: Default::default(),
             len: "😀".len(),
             font_id: FontId(7),
         }];

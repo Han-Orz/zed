@@ -1,8 +1,12 @@
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
+use crate::{FontId, Pixels, SharedString, TextAutospace, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, sync::Arc};
+use unicode_segmentation::UnicodeSegmentation;
 
-use super::line_breaks::{self, BreakKind, BreakPoint};
+use super::{
+    autospace::{self, Spacing},
+    line_breaks::{self, BreakKind, BreakPoint},
+};
 
 /// Determines whether to truncate text from the start or end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,6 +24,7 @@ pub struct LineWrapper {
     text_system: Arc<TextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
+    pub(crate) text_autospace: TextAutospace,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
 }
@@ -33,6 +38,7 @@ impl LineWrapper {
             text_system,
             font_id,
             font_size,
+            text_autospace: TextAutospace::None,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
         }
@@ -59,6 +65,7 @@ impl LineWrapper {
             ),
         };
         let mut opportunities = line_breaks::opportunities(&text).peekable();
+        let mut spacing = self.spacing(&text).into_iter().peekable();
         let mut width = px(0.);
         let mut byte = 0;
         let mut context_byte = 0;
@@ -69,6 +76,8 @@ impl LineWrapper {
             .flat_map(LineFragment::wrap_boundary_candidates)
         {
             let candidate_length = candidate.len_utf8();
+            let trailing_spacing = autospace::advance_at(&mut spacing, context_byte);
+            width += trailing_spacing;
             while opportunities
                 .peek()
                 .is_some_and(|&(index, _)| index < context_byte)
@@ -82,6 +91,7 @@ impl LineWrapper {
                 points.push(BreakPoint {
                     byte,
                     x: width,
+                    trailing_spacing,
                     boundary: Some(byte),
                     kind,
                 });
@@ -107,6 +117,7 @@ impl LineWrapper {
         points.push(BreakPoint {
             byte,
             x: width,
+            trailing_spacing: px(0.),
             boundary: None,
             kind: BreakKind::Normal,
         });
@@ -125,45 +136,43 @@ impl LineWrapper {
         truncation_affix: &str,
         truncate_from: TruncateFrom,
     ) -> Option<usize> {
-        let mut width = px(0.);
         let suffix_width = truncation_affix
             .chars()
             .map(|c| self.width_for_char(c))
             .fold(px(0.0), |a, x| a + x);
-        let mut truncate_ix = 0;
-
+        let units = self.units(line);
+        if units.last().map_or(px(0.), |unit| unit.2) <= truncate_width {
+            return None;
+        }
+        let mut width = px(0.);
+        let mut truncate_index = 0;
         match truncate_from {
             TruncateFrom::Start => {
-                for (ix, c) in line.char_indices().rev() {
+                let end = units.last().map_or(px(0.), |unit| unit.2);
+                for (range, x, _) in units.iter().rev() {
                     if width + suffix_width < truncate_width {
-                        truncate_ix = ix;
+                        // The caller removes through ceil_char_boundary(index + 1).
+                        truncate_index = range.end.saturating_sub(1);
                     }
-
-                    let char_width = self.width_for_char(c);
-                    width += char_width;
-
+                    width = end - *x;
                     if width.floor() > truncate_width {
-                        return Some(truncate_ix);
+                        return Some(truncate_index);
                     }
                 }
             }
             TruncateFrom::End => {
-                for (ix, c) in line.char_indices() {
+                for (range, _, end) in &units {
                     if width + suffix_width < truncate_width {
-                        truncate_ix = ix;
+                        truncate_index = range.start;
                     }
-
-                    let char_width = self.width_for_char(c);
-                    width += char_width;
-
+                    width = *end;
                     if width.floor() > truncate_width {
-                        return Some(truncate_ix);
+                        return Some(truncate_index);
                     }
                 }
             }
             TruncateFrom::Middle => {}
         }
-
         None
     }
 
@@ -178,10 +187,8 @@ impl LineWrapper {
             .map(|c| self.width_for_char(c))
             .fold(px(0.0), |a, x| a + x);
 
-        let total_width: Pixels = line
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
+        let units = self.units(line);
+        let total_width = units.last().map_or(px(0.), |unit| unit.2);
 
         if total_width <= truncate_width {
             return None;
@@ -195,27 +202,17 @@ impl LineWrapper {
         let front_budget = content_budget * (2.0 / 3.0);
         let back_budget = content_budget - front_budget;
 
-        let mut front_width = px(0.);
-        let mut front_end_ix = 0usize;
-        for (ix, c) in line.char_indices() {
-            let char_width = self.width_for_char(c);
-            if front_width + char_width > front_budget {
-                break;
-            }
-            front_width += char_width;
-            front_end_ix = ix + c.len_utf8();
-        }
-
-        let mut back_width = px(0.);
-        let mut back_start_ix = line.len();
-        for (ix, c) in line.char_indices().rev() {
-            let char_width = self.width_for_char(c);
-            if back_width + char_width > back_budget {
-                break;
-            }
-            back_width += char_width;
-            back_start_ix = ix;
-        }
+        let front_end_ix = units
+            .iter()
+            .take_while(|unit| unit.2 <= front_budget)
+            .last()
+            .map_or(0, |unit| unit.0.end);
+        let back_start_ix = units
+            .iter()
+            .rev()
+            .take_while(|unit| total_width - unit.1 <= back_budget && unit.0.start >= front_end_ix)
+            .last()
+            .map_or(line.len(), |unit| unit.0.start);
 
         if front_end_ix >= back_start_ix {
             return Some((0, line.len()));
@@ -343,6 +340,31 @@ impl LineWrapper {
             offset += hard_line.len() + 1;
         }
         (text, Cow::Borrowed(runs))
+    }
+
+    fn spacing(&mut self, text: &str) -> Vec<Spacing> {
+        if self.text_autospace == TextAutospace::None {
+            return Vec::new();
+        }
+        let advance = self.width_for_char('水') / 8.;
+        autospace::boundaries(text)
+            .map(|(byte, _)| Spacing { byte, advance })
+            .collect()
+    }
+
+    fn units(&mut self, text: &str) -> Vec<(std::ops::Range<usize>, Pixels, Pixels)> {
+        let mut spacing = self.spacing(text).into_iter().peekable();
+        let mut x = px(0.);
+        text.grapheme_indices(true)
+            .map(|(byte, grapheme)| {
+                x += autospace::advance_at(&mut spacing, byte);
+                let start = x;
+                for character in grapheme.chars() {
+                    x += self.width_for_char(character);
+                }
+                (byte..byte + grapheme.len(), start, x)
+            })
+            .collect()
     }
 
     #[inline(always)]
@@ -552,6 +574,33 @@ mod tests {
         let cx = TestAppContext::build(dispatcher, None);
         let id = cx.text_system().resolve_font(&font(".ZedMono"));
         LineWrapper::new(id, px(16.), cx.text_system().clone())
+    }
+
+    #[test]
+    fn autospace_wrapper_fits_without_retaining_edge_spacing() {
+        let mut wrapper = build_wrapper();
+        let raw_width = wrapper.width_for_char('甲') + wrapper.width_for_char('A');
+        let gap = wrapper.width_for_char('水') / 8.;
+        wrapper.text_autospace = TextAutospace::IdeographAlphaNumeric;
+        let text = "甲A乙";
+        let wraps: Vec<_> = wrapper
+            .wrap_line(&[LineFragment::text(text)], raw_width + gap)
+            .collect();
+        assert_eq!(
+            wraps.iter().map(|boundary| boundary.ix).collect::<Vec<_>>(),
+            [4]
+        );
+        for text in ["甲e\u{301}乙", "甲👩‍👩‍👧‍👦乙"] {
+            let (short, _) =
+                wrapper.truncate_line(text.into(), raw_width, "…", &[], TruncateFrom::End);
+            let prefix = short.trim_end_matches('…');
+            assert!(
+                text.grapheme_indices(true)
+                    .map(|entry| entry.0)
+                    .chain([text.len()])
+                    .any(|byte| byte == prefix.len())
+            );
+        }
     }
 
     fn generate_test_runs(input_run_len: &[usize]) -> Vec<TextRun> {

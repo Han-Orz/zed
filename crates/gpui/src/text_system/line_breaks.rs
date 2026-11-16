@@ -48,6 +48,7 @@ pub(super) fn opportunities(text: &str) -> impl Iterator<Item = (usize, BreakKin
 pub(super) struct BreakPoint<T> {
     pub byte: usize,
     pub x: Pixels,
+    pub trailing_spacing: Pixels,
     pub boundary: Option<T>,
     pub kind: BreakKind,
 }
@@ -77,7 +78,7 @@ pub(super) fn fit<T: Copy>(
         let indent_width = indentation.map_or(px(0.), |(_, _, space_width, _)| {
             space_width * indent.unwrap_or(0) as f32
         });
-        if point.x - start_x + indent_width <= width {
+        if point.x - point.trailing_spacing - start_x + indent_width <= width {
             if point.boundary.is_none() {
                 break;
             }
@@ -126,12 +127,14 @@ mod tests {
             .map(|(column, (byte, kind))| BreakPoint {
                 byte,
                 x: px(column as f32),
+                trailing_spacing: px(0.),
                 boundary: Some(byte),
                 kind,
             })
             .chain(std::iter::once(BreakPoint {
                 byte: text.len(),
                 x: px(text.graphemes(true).count() as f32),
+                trailing_spacing: px(0.),
                 boundary: None,
                 kind: BreakKind::Normal,
             }))

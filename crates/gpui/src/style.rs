@@ -445,6 +445,9 @@ pub struct TextStyle {
     /// The font features to use
     pub font_features: FontFeatures,
 
+    /// Contextual spacing without adding text characters.
+    pub text_autospace: crate::TextAutospace,
+
     /// The fallback fonts to use
     pub font_fallbacks: Option<FontFallbacks>,
 
@@ -489,6 +492,7 @@ impl Default for TextStyle {
             // todo(linux) make this configurable or choose better default
             font_family: ".SystemUIFont".into(),
             font_features: FontFeatures::default(),
+            text_autospace: crate::TextAutospace::None,
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: phi(),
@@ -567,6 +571,7 @@ impl TextStyle {
                 style: self.font_style,
             },
             color: self.color,
+            text_autospace: self.text_autospace,
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,

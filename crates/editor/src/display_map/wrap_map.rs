@@ -276,7 +276,8 @@ impl WrapMap {
             let (font, font_size) = self.font_with_size.clone();
             let mut fragment_builder =
                 LineFragmentBuilder::new(text_system.clone(), &font, font_size);
-            let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            let mut line_wrapper =
+                text_system.line_wrapper(font, font_size, gpui::TextAutospace::None);
             let tab_snapshot = new_snapshot.tab_snapshot.clone();
             let total_rows = tab_snapshot.max_point().row() as usize + 1;
             let range = TabPoint::zero()..tab_snapshot.max_point();
@@ -380,7 +381,8 @@ impl WrapMap {
             let (font, font_size) = self.font_with_size.clone();
             let mut fragment_builder =
                 LineFragmentBuilder::new(text_system.clone(), &font, font_size);
-            let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            let mut line_wrapper =
+                text_system.line_wrapper(font, font_size, gpui::TextAutospace::None);
 
             let update_passes = pending_edits.len();
             let total_new_rows = pending_edits
@@ -1693,7 +1695,8 @@ mod tests {
         let tabs_snapshot = tab_map.set_max_expansion_column(32);
         log::info!("TabMap text: {:?}", tabs_snapshot.text());
 
-        let mut line_wrapper = text_system.line_wrapper(font.clone(), font_size);
+        let mut line_wrapper =
+            text_system.line_wrapper(font.clone(), font_size, gpui::TextAutospace::None);
         let expected_text = wrap_text(&tabs_snapshot, wrap_width, &mut line_wrapper);
 
         let (wrap_map, _) =

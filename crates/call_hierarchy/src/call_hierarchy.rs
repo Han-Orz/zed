@@ -1166,6 +1166,7 @@ fn shaped_width(
     window: &Window,
 ) -> Pixels {
     let run = TextRun {
+        text_autospace: Default::default(),
         len: text.len(),
         font,
         color: gpui::Hsla::default(),

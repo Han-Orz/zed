@@ -9,10 +9,13 @@ use std::{
     sync::Arc,
 };
 
-use super::line_breaks::{self, BreakKind, BreakPoint};
+use super::{
+    autospace::{self, Spacing, TextAutospace},
+    line_breaks::{self, BreakKind, BreakPoint},
+};
 
 /// A laid out and styled line of text
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct LineLayout {
     /// The font size for this line
     pub font_size: Pixels,
@@ -192,9 +195,11 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        spacing: &[Spacing],
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut opportunities = line_breaks::opportunities(text).peekable();
         let mut previous_byte = None;
+        let mut spacing = spacing.iter().copied().peekable();
         let points: Vec<_> = self
             .runs
             .iter()
@@ -219,6 +224,7 @@ impl LineLayout {
                 (byte == glyph.index && kind != BreakKind::Prohibited).then_some(BreakPoint {
                     byte,
                     x: glyph.position.x,
+                    trailing_spacing: autospace::advance_at(&mut spacing, byte),
                     boundary: Some(WrapBoundary { run_ix, glyph_ix }),
                     kind,
                 })
@@ -226,6 +232,7 @@ impl LineLayout {
             .chain(std::iter::once(BreakPoint {
                 byte: text.len(),
                 x: self.width,
+                trailing_spacing: px(0.),
                 boundary: None,
                 kind: BreakKind::Normal,
             }))
@@ -544,6 +551,43 @@ impl LineLayoutCache {
         curr_frame.used_wrapped_lines_by_hash.clear();
     }
 
+    fn spacing(&self, text: &str, layout: &LineLayout, runs: &[FontRun]) -> Vec<Spacing> {
+        if !runs
+            .iter()
+            .any(|run| run.text_autospace != TextAutospace::None)
+        {
+            return Vec::new();
+        }
+        let mut glyphs = layout.runs.iter().flat_map(|run| &run.glyphs).peekable();
+        let mut advance = None;
+        autospace::enabled_boundaries(text, runs)
+            .filter_map(|(byte, ideograph)| {
+                while glyphs.peek().is_some_and(|glyph| glyph.index < byte) {
+                    glyphs.next();
+                }
+                if !glyphs.peek().is_some_and(|glyph| glyph.index == byte) {
+                    return None;
+                }
+                let font_id = layout.font_id_for_index(ideograph)?;
+                let advance = *advance.get_or_insert_with(|| {
+                    self.platform_text_system
+                        .layout_line(
+                            "水",
+                            layout.font_size,
+                            &[FontRun {
+                                len: '水'.len_utf8(),
+                                font_id,
+                                text_autospace: TextAutospace::None,
+                            }],
+                        )
+                        .width
+                        / 8.
+                });
+                Some(Spacing { byte, advance })
+            })
+            .collect()
+    }
+
     pub fn layout_wrapped_line<Text>(
         &self,
         text: Text,
@@ -580,12 +624,39 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let mut unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let spacing = self.spacing(&text, &unwrapped_layout, runs);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+                unwrapped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    &spacing,
+                )
             } else {
                 SmallVec::new()
             };
+            let mut breaks = wrap_boundaries
+                .iter()
+                .map(|boundary| {
+                    unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+                })
+                .peekable();
+            let removed: Vec<_> = spacing
+                .into_iter()
+                .filter(|space| {
+                    while breaks.peek().is_some_and(|&byte| byte < space.byte) {
+                        breaks.next();
+                    }
+                    breaks.peek() == Some(&space.byte)
+                })
+                .collect();
+            if !removed.is_empty() {
+                let mut trimmed = (*unwrapped_layout).clone();
+                apply_spacing(&mut trimmed, &removed, -1.);
+                unwrapped_layout = Arc::new(trimmed);
+            }
             let layout = Arc::new(WrappedLineLayout {
                 unwrapped_layout,
                 wrap_boundaries,
@@ -646,6 +717,9 @@ impl LineLayoutCache {
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
+            } else {
+                let spacing = self.spacing(&text, &layout, runs);
+                apply_spacing(&mut layout, &spacing, 1.);
             }
 
             let key = Arc::new(CacheKey {
@@ -795,6 +869,9 @@ impl LineLayoutCache {
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
+        } else {
+            let spacing = self.spacing(&text, &layout, runs);
+            apply_spacing(&mut layout, &spacing, 1.);
         }
 
         let key = Arc::new(HashedCacheKey {
@@ -814,11 +891,23 @@ impl LineLayoutCache {
     }
 }
 
-// Combining marks (e.g. Thai vowel signs, Arabic diacritics) are shaped by
-// HarfBuzz at the same x position as their base character. The force-width
-// loop must not advance the cell counter for these zero-advance glyphs,
-// otherwise they get displaced into the next cell. We detect them by checking
-// whether shaped x has advanced by at least half a cell beyond the last base.
+fn apply_spacing(layout: &mut LineLayout, spacing: &[Spacing], direction: f32) {
+    if spacing.is_empty() {
+        return;
+    }
+    let mut spacing = spacing.iter().peekable();
+    let mut offset = px(0.);
+    for glyph in layout.runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+        while let Some(space) = spacing.next_if(|space| space.byte <= glyph.index) {
+            offset += space.advance * direction;
+        }
+        glyph.position.x += offset;
+    }
+    layout.width += offset;
+}
+
+// Combining marks share the base's shaped x. Preserve that relationship when
+// assigning forced cells instead of advancing them into the next cell.
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
     // NEG_INFINITY ensures the first glyph is always classified as a base.
@@ -850,6 +939,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    pub text_autospace: TextAutospace,
 }
 
 trait AsCacheKeyRef {
@@ -995,7 +1085,86 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate as gpui;
     use crate::GlyphId;
+
+    #[crate::test]
+    fn autospace_cache_keeps_bytes_and_separates_opted_in_layouts(cx: &mut crate::TestAppContext) {
+        cx.update(|cx| {
+            let system = crate::WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "甲Rust2026乙".into();
+            let mut run = crate::TextRun {
+                len: text.len(),
+                font: crate::font(".ZedSans"),
+                ..Default::default()
+            };
+            let plain = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
+            run.text_autospace = TextAutospace::IdeographAlphaNumeric;
+            let spaced = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
+            let again = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
+            assert!(Arc::ptr_eq(&spaced.layout, &again.layout));
+            assert!(!Arc::ptr_eq(&plain.layout, &spaced.layout));
+            assert_eq!(spaced.text, text);
+            assert_eq!(spaced.len, text.len());
+            let font = cx.text_system().resolve_font(&run.font);
+            let gap = cx.text_system().layout_width(font, px(24.), '水') / 8.;
+            assert!((spaced.width - plain.width - gap * 2.).abs() < px(0.001));
+            let indices = |layout: &LineLayout| {
+                layout
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(indices(&spaced), indices(&plain));
+            for (byte, _) in text.char_indices() {
+                let count = usize::from(byte >= 3) + usize::from(byte >= "甲Rust2026".len());
+                assert!(
+                    (spaced.x_for_index(byte) - plain.x_for_index(byte) - gap * count).abs()
+                        < px(0.001)
+                );
+            }
+            run.text_autospace = TextAutospace::None;
+            let plain_again = system.shape_line(text, px(24.), &[run], None);
+            assert!(Arc::ptr_eq(&plain.layout, &plain_again.layout));
+        });
+    }
+
+    #[crate::test]
+    fn autospace_wrap_trims_only_the_gap_at_the_break(cx: &mut crate::TestAppContext) {
+        cx.update(|cx| {
+            let system = crate::WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "甲A乙".into();
+            let mut run = crate::TextRun {
+                len: text.len(),
+                font: crate::font(".ZedSans"),
+                ..Default::default()
+            };
+            let plain = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
+            let font = cx.text_system().resolve_font(&run.font);
+            let gap = cx.text_system().layout_width(font, px(24.), '水') / 8.;
+            run.text_autospace = TextAutospace::IdeographAlphaNumeric;
+            let width = plain.x_for_index(4) + gap;
+            let wrapped = system
+                .shape_text(text.clone(), px(24.), &[run], Some(width), None)
+                .unwrap();
+            let layout = &wrapped[0];
+            let bytes: Vec<_> = layout
+                .wrap_boundaries
+                .iter()
+                .map(|boundary| layout.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .collect();
+            assert_eq!(bytes, [4]);
+            assert!((layout.unwrapped_layout.width - plain.width - gap).abs() < px(0.001));
+            assert!((layout.unwrapped_layout.x_for_index(4) - width).abs() < px(0.001));
+            assert_eq!(layout.text, text);
+            assert_eq!(layout.unwrapped_layout.len, text.len());
+            assert_eq!(
+                layout.index_for_position(point(px(0.), px(24.)), px(24.)),
+                Ok(4)
+            );
+        });
+    }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -1037,7 +1206,7 @@ mod tests {
             ..LineLayout::default()
         };
         for width in [0., 5., 10., 20., 30., 50., 80.] {
-            let boundaries = layout.compute_wrap_boundaries(text, px(width), None);
+            let boundaries = layout.compute_wrap_boundaries(text, px(width), None, &[]);
             let mut previous = 0;
             for boundary in boundaries {
                 let byte = layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
@@ -1050,12 +1219,12 @@ mod tests {
             }
             assert!(
                 layout
-                    .compute_wrap_boundaries(text, px(width), Some(1))
+                    .compute_wrap_boundaries(text, px(width), Some(1), &[])
                     .is_empty()
             );
             assert!(
                 layout
-                    .compute_wrap_boundaries(text, px(width), Some(2))
+                    .compute_wrap_boundaries(text, px(width), Some(2), &[])
                     .len()
                     <= 1
             );

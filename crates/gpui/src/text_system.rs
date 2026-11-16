@@ -1,3 +1,4 @@
+mod autospace;
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -5,6 +6,7 @@ mod line_breaks;
 mod line_layout;
 mod line_wrapper;
 
+pub use autospace::TextAutospace;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
@@ -228,6 +230,7 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    text_autospace: TextAutospace::None,
                 }],
             )
             .width
@@ -317,15 +320,21 @@ impl TextSystem {
     }
 
     /// Returns a handle to a line wrapper, for the given font and font size.
-    pub fn line_wrapper(self: &Arc<Self>, font: Font, font_size: Pixels) -> LineWrapperHandle {
+    pub fn line_wrapper(
+        self: &Arc<Self>,
+        font: Font,
+        font_size: Pixels,
+        text_autospace: TextAutospace,
+    ) -> LineWrapperHandle {
         let lock = &mut self.wrapper_pool.lock();
         let font_id = self.resolve_font(&font);
         let wrappers = lock
             .entry(FontIdWithSize { font_id, font_size })
             .or_default();
-        let wrapper = wrappers
+        let mut wrapper = wrappers
             .pop()
             .unwrap_or_else(|| LineWrapper::new(font_id, font_size, self.clone()));
+        wrapper.text_autospace = text_autospace;
 
         LineWrapperHandle {
             wrapper: Some(wrapper),
@@ -569,6 +578,7 @@ impl WindowTextSystem {
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && run.text_autospace == font_run.text_autospace
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -576,6 +586,7 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        text_autospace: run.text_autospace,
                     });
                 }
 
@@ -683,6 +694,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.text_autospace == font_run.text_autospace
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -690,6 +702,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    text_autospace: run.text_autospace,
                 });
             }
         }
@@ -717,6 +730,7 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    text_autospace: TextAutospace::None,
                 }],
                 None,
             )
@@ -765,6 +779,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.text_autospace == font_run.text_autospace
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -772,6 +787,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    text_autospace: run.text_autospace,
                 });
             }
         }
@@ -827,6 +843,7 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.text_autospace == font_run.text_autospace
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -834,6 +851,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    text_autospace: run.text_autospace,
                 });
             }
         }
@@ -1002,6 +1020,8 @@ pub struct TextRun {
     pub len: usize,
     /// The font to use for this run.
     pub font: Font,
+    /// Contextual spacing, without inserting characters into the text.
+    pub text_autospace: TextAutospace,
     /// The color
     pub color: Hsla,
     /// The background color (if any)

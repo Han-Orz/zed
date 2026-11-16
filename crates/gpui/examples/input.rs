@@ -466,6 +466,7 @@ impl Element for TextElement {
         };
 
         let run = TextRun {
+            text_autospace: style.text_autospace,
             len: display_text.len(),
             font: style.font(),
             color: text_color,

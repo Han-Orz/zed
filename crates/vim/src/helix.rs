@@ -1298,6 +1298,7 @@ impl Vim {
             }
 
             let run = gpui::TextRun {
+                text_autospace: Default::default(),
                 len: text.len(),
                 font: font.clone(),
                 color: Hsla::default(),

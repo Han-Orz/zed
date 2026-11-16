@@ -811,6 +811,7 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
         let end = offs.min(range.end);
         if start < end {
             clipped.push(FontRun {
+                text_autospace: run.text_autospace,
                 len: end - start,
                 font_id: run.font_id,
             });
@@ -1146,6 +1147,7 @@ mod tests {
     fn layout_text(text_system: &CosmicTextSystem, text: &str) -> Result<LineLayout> {
         let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
         let runs = [FontRun {
+            text_autospace: Default::default(),
             len: text.len(),
             font_id,
         }];
@@ -1255,10 +1257,12 @@ mod tests {
         // The run boundary falls inside the trailing RTL paragraph.
         let runs = [
             FontRun {
+                text_autospace: Default::default(),
                 len: "ab\u{001c}\u{05d0}".len(),
                 font_id,
             },
             FontRun {
+                text_autospace: Default::default(),
                 len: "\u{05d1}".len(),
                 font_id,
             },
@@ -1312,10 +1316,12 @@ mod tests {
     fn font_runs_are_clipped_to_segment() {
         let runs = [
             FontRun {
+                text_autospace: Default::default(),
                 len: 3,
                 font_id: fid(1),
             },
             FontRun {
+                text_autospace: Default::default(),
                 len: 4,
                 font_id: fid(2),
             },
@@ -1326,10 +1332,12 @@ mod tests {
             clip_font_runs(&runs, 2..5).as_slice(),
             &[
                 FontRun {
+                    text_autospace: Default::default(),
                     len: 1,
                     font_id: fid(1)
                 },
                 FontRun {
+                    text_autospace: Default::default(),
                     len: 2,
                     font_id: fid(2)
                 },
@@ -1338,6 +1346,7 @@ mod tests {
         assert_eq!(
             clip_font_runs(&runs, 3..7).as_slice(),
             &[FontRun {
+                text_autospace: Default::default(),
                 len: 4,
                 font_id: fid(2)
             }]
