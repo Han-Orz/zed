@@ -1085,11 +1085,11 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate as gpui;
     use crate::GlyphId;
 
-    #[crate::test]
-    fn autospace_cache_keeps_bytes_and_separates_opted_in_layouts(cx: &mut crate::TestAppContext) {
+    #[test]
+    fn autospace_cache_keeps_bytes_and_separates_opted_in_layouts() {
+        let mut cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
         cx.update(|cx| {
             let system = crate::WindowTextSystem::new(cx.text_system().clone());
             let text: SharedString = "甲Rust2026乙".into();
@@ -1130,8 +1130,9 @@ mod tests {
         });
     }
 
-    #[crate::test]
-    fn autospace_wrap_trims_only_the_gap_at_the_break(cx: &mut crate::TestAppContext) {
+    #[test]
+    fn autospace_wrap_trims_only_the_gap_at_the_break() {
+        let mut cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
         cx.update(|cx| {
             let system = crate::WindowTextSystem::new(cx.text_system().clone());
             let text: SharedString = "甲A乙".into();
