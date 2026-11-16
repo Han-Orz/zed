@@ -5864,13 +5864,8 @@ impl Window {
         } else if let Some(key_down_event) = event.downcast_ref::<KeyDownEvent>() {
             self.pending_modifier.saw_other_input = true;
             keystroke = Some(key_down_event.keystroke.clone());
-            if key_down_event.keystroke.key_char.is_some()
-                && matches!(
-                    cx.cursor_hide_mode,
-                    CursorHideMode::OnTyping | CursorHideMode::OnTypingAndAction
-                )
-            {
-                cx.platform.hide_cursor_until_mouse_moves();
+            if key_down_event.keystroke.key_char.is_some() {
+                cx.hide_cursor_for_typing();
             }
         }
 

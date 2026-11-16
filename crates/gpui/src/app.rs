@@ -343,10 +343,10 @@ pub enum QuitMode {
 pub enum CursorHideMode {
     /// Never hide the cursor automatically.
     Never,
-    /// Hide on character-producing key presses (typing).
+    /// Hide on character-producing key presses and native text/composition input.
     OnTyping,
-    /// Hide on character-producing key presses, *and* when a key binding
-    /// resolves to an action that consumes the keystroke.
+    /// Hide on typing, including native text/composition input, and when a key
+    /// binding resolves to an action that consumes the keystroke.
     #[default]
     OnTypingAndAction,
 }
@@ -1060,6 +1060,15 @@ impl App {
     /// to keyboard input.
     pub fn set_cursor_hide_mode(&mut self, mode: CursorHideMode) {
         self.cursor_hide_mode = mode;
+    }
+
+    pub(crate) fn hide_cursor_for_typing(&self) {
+        if matches!(
+            self.cursor_hide_mode,
+            CursorHideMode::OnTyping | CursorHideMode::OnTypingAndAction
+        ) {
+            self.platform.hide_cursor_until_mouse_moves();
+        }
     }
 
     /// Returns whether the cursor is currently visible according to the

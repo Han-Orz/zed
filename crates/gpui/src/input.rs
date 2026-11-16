@@ -292,6 +292,110 @@ mod tests {
         TextInputStateChange, canvas, div,
     };
 
+    fn cursor_hide_fixture(
+        mode: crate::CursorHideMode,
+    ) -> (
+        TestAppContext,
+        crate::PlatformInputHandler,
+        Entity<ConfigurationTestView>,
+        crate::WindowHandle<ConfigurationTestView>,
+    ) {
+        let mut cx = TestAppContext::build(crate::TestDispatcher::new(0), None);
+        cx.update(|cx| cx.set_cursor_hide_mode(mode));
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            committed_text: String::new(),
+            marked_text: None,
+        });
+        let view = window.root(&mut cx).unwrap();
+        let handler = cx
+            .update_window(window.into(), |_, window, cx| {
+                crate::PlatformInputHandler::new(
+                    window.to_async(cx),
+                    Box::new(ElementInputHandler::new(Bounds::default(), view.clone())),
+                )
+            })
+            .unwrap();
+        (cx, handler, view, window)
+    }
+
+    #[test]
+    fn cursor_hide_native_text_commit_respects_the_existing_policy() {
+        for mode in [
+            crate::CursorHideMode::Never,
+            crate::CursorHideMode::OnTyping,
+            crate::CursorHideMode::OnTypingAndAction,
+        ] {
+            let (mut cx, mut handler, view, _) = cursor_hide_fixture(mode);
+            handler.replace_text_in_range(None, "输入Rust");
+            assert_eq!(
+                cx.update(|cx| cx.is_cursor_visible()),
+                mode == crate::CursorHideMode::Never
+            );
+            assert_eq!(
+                view.read_with(&cx, |view, _| view.committed_text.clone()),
+                "输入Rust"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_hide_native_preedit_respects_the_existing_policy() {
+        for mode in [
+            crate::CursorHideMode::Never,
+            crate::CursorHideMode::OnTyping,
+            crate::CursorHideMode::OnTypingAndAction,
+        ] {
+            let (mut cx, mut handler, view, _) = cursor_hide_fixture(mode);
+            handler.replace_and_mark_text_in_range(None, "拼", Some(1..1));
+            assert_eq!(
+                cx.update(|cx| cx.is_cursor_visible()),
+                mode == crate::CursorHideMode::Never
+            );
+            assert_eq!(
+                view.read_with(&cx, |view, _| view.marked_text.clone()),
+                Some("拼".to_owned())
+            );
+            assert!(view.read_with(&cx, |view, _| view.committed_text.is_empty()));
+        }
+    }
+
+    #[test]
+    fn cursor_hide_empty_composition_and_geometry_queries_do_not_hide() {
+        let (mut cx, mut handler, _, _) =
+            cursor_hide_fixture(crate::CursorHideMode::OnTypingAndAction);
+        handler.replace_text_in_range(None, "");
+        handler.replace_and_mark_text_in_range(None, "", None);
+        handler.unmark_text();
+        handler.selected_text_range(false);
+        handler.bounds_for_range(0..0);
+        assert!(cx.update(|cx| cx.is_cursor_visible()));
+    }
+
+    #[test]
+    fn cursor_hide_dispatched_text_uses_the_same_typing_policy() {
+        for mode in [
+            crate::CursorHideMode::Never,
+            crate::CursorHideMode::OnTyping,
+            crate::CursorHideMode::OnTypingAndAction,
+        ] {
+            let (mut cx, mut handler, view, window) = cursor_hide_fixture(mode);
+            cx.update_window(window.into(), |_, window, cx| {
+                handler.dispatch_input("a", window, cx)
+            })
+            .unwrap();
+            assert_eq!(
+                cx.update(|cx| cx.is_cursor_visible()),
+                mode == crate::CursorHideMode::Never
+            );
+            assert_eq!(
+                view.read_with(&cx, |view, _| view.committed_text.clone()),
+                "a"
+            );
+        }
+    }
+
     #[gpui::test]
     fn text_input_configuration_and_focus_state_are_forwarded_on_change(cx: &mut TestAppContext) {
         let custom = TextInputConfiguration {
@@ -304,6 +408,8 @@ mod tests {
             move |_, cx| ConfigurationTestView {
                 focus_handle: cx.focus_handle(),
                 configuration: custom,
+                committed_text: String::new(),
+                marked_text: None,
             }
         });
         let view = window.root(cx).unwrap();
@@ -384,6 +490,8 @@ mod tests {
     struct ConfigurationTestView {
         focus_handle: FocusHandle,
         configuration: TextInputConfiguration,
+        committed_text: String,
+        marked_text: Option<String>,
     }
 
     impl Render for ConfigurationTestView {
@@ -439,20 +547,23 @@ mod tests {
         fn replace_text_in_range(
             &mut self,
             _range: Option<std::ops::Range<usize>>,
-            _text: &str,
+            text: &str,
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) {
+            self.committed_text = text.to_owned();
+            self.marked_text = None;
         }
 
         fn replace_and_mark_text_in_range(
             &mut self,
             _range: Option<std::ops::Range<usize>>,
-            _new_text: &str,
+            new_text: &str,
             _new_selected_range: Option<std::ops::Range<usize>>,
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) {
+            self.marked_text = Some(new_text.to_owned());
         }
 
         fn bounds_for_range(

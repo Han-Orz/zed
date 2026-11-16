@@ -1609,6 +1609,9 @@ impl PlatformInputHandler {
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
+                if !text.is_empty() {
+                    cx.hide_cursor_for_typing();
+                }
                 self.handler
                     .replace_text_in_range(replacement_range, text, window, cx);
             })
@@ -1623,6 +1626,10 @@ impl PlatformInputHandler {
     ) {
         self.cx
             .update(|window, cx| {
+                // Clearing a composition may follow a mouse action, not typing.
+                if !new_text.is_empty() {
+                    cx.hide_cursor_for_typing();
+                }
                 self.handler.replace_and_mark_text_in_range(
                     range_utf16,
                     new_text,
@@ -1660,6 +1667,9 @@ impl PlatformInputHandler {
     }
 
     pub fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
+        if !input.is_empty() {
+            cx.hide_cursor_for_typing();
+        }
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
