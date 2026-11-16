@@ -30,6 +30,8 @@ fn class(grapheme: &str) -> Class {
         Class::Ideograph
     } else if base.width() == Some(1)
         && (base.is_ascii_digit() || (base.script() == Script::Latin && base.is_alphabetic()))
+        // A keycap's leading digit belongs to an emoji, not a numeric unit.
+        && !grapheme.contains('\u{20e3}')
     {
         Class::AlphaNumeric
     } else {
@@ -133,6 +135,9 @@ mod tests {
             "甲，A",
             "甲（A）乙",
             "甲👩‍👩‍👧‍👦乙",
+            "甲1️⃣乙",
+            "甲1\u{20e3}乙",
+            "甲1️⃣\u{301}乙",
             "甲Ａ１２乙",
             "甲\nA",
             "甲\u{fffc}乙",

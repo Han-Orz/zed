@@ -221,7 +221,7 @@ impl LineLayout {
                     opportunities.next();
                 }
                 let &(byte, kind) = opportunities.peek()?;
-                (byte == glyph.index && kind != BreakKind::Prohibited).then_some(BreakPoint {
+                (byte == glyph.index && kind != BreakKind::Prohibited).then(|| BreakPoint {
                     byte,
                     x: glyph.position.x,
                     trailing_spacing: autospace::advance_at(&mut spacing, byte),
@@ -1182,6 +1182,42 @@ mod tests {
             index,
             is_emoji: false,
         }
+    }
+
+    #[test]
+    fn autospace_wrap_keeps_future_gap_after_combining_cluster_glyphs() {
+        let text = "甲e\u{301}乙";
+        let mut layout = LineLayout {
+            width: px(30.),
+            len: text.len(),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    glyph_at(0., 0),
+                    glyph_at(10., 3),
+                    glyph_at(10., 4),
+                    glyph_at(20., 6),
+                ],
+            }],
+            ..LineLayout::default()
+        };
+        let spacing = [
+            Spacing {
+                byte: 3,
+                advance: px(1.),
+            },
+            Spacing {
+                byte: 6,
+                advance: px(1.),
+            },
+        ];
+        apply_spacing(&mut layout, &spacing, 1.);
+        let boundaries = layout.compute_wrap_boundaries(text, px(21.), None, &spacing);
+        let bytes: Vec<_> = boundaries
+            .iter()
+            .map(|boundary| layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+            .collect();
+        assert_eq!(bytes, [6]);
     }
 
     #[test]
