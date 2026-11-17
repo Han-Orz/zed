@@ -1,4 +1,4 @@
-use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
+use std::{cell::Cell, rc::Rc};
 
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -33,7 +33,7 @@ pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
-/// shared with every window (like `WindowsPlatformState::cursor_visible`),
+/// shared with every window (like `WindowsPlatformState::cursor_hidden_at`),
 /// because the coordination is inherently cross-window: while window A is
 /// drawing, a re-entrant paint request for window B must be deferred.
 pub(crate) struct DrawCoordinator {
@@ -402,9 +402,9 @@ impl WindowsWindowInner {
 
     fn handle_mouse_leave_msg(&self) -> Option<isize> {
         self.state.hovered.set(false);
-        // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
-        // the flag for tight `is_cursor_visible()` semantics.
-        self.state.cursor_visible.store(true, Ordering::Relaxed);
+        // Client/nonclient tracking can emit leave while the pointer is still
+        // stationary over this window. It is not evidence of displacement.
+        self.restore_cursor_after_hide();
         if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
             callback(false);
             self.state
@@ -822,7 +822,7 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
-            this.state.cursor_visible.store(true, Ordering::Relaxed);
+            this.state.cursor_hidden_at.set(None);
         }
 
         // When the window is activated (gains focus), reset the modifier tracking state.
@@ -1208,7 +1208,14 @@ impl WindowsWindowInner {
         });
 
         if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+            let cursor = self
+                .state
+                .cursor_hidden_at
+                .get()
+                .is_none()
+                .then(|| self.state.current_cursor.get())
+                .flatten();
+            unsafe { SetCursor(cursor) };
         }
 
         Some(0)
@@ -1230,7 +1237,7 @@ impl WindowsWindowInner {
         {
             return None;
         }
-        let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
+        let cursor = if self.state.cursor_hidden_at.get().is_none() {
             self.state.current_cursor.get()
         } else {
             None
@@ -1442,12 +1449,21 @@ impl WindowsWindowInner {
         }
     }
 
-    /// Clear the hidden flag and restore the cursor immediately
+    /// Windows can synthesize mouse-move messages after a layout/cursor update
+    /// without moving the pointer. Only screen displacement releases typing.
     fn restore_cursor_after_hide(&self) {
-        if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
-            unsafe {
-                SetCursor(self.state.current_cursor.get());
-            }
+        let Some(hidden_at) = self.state.cursor_hidden_at.get() else {
+            return;
+        };
+        let mut position = POINT::default();
+        if unsafe { GetCursorPos(&mut position) }.log_err().is_none()
+            || (position.x, position.y) == hidden_at
+        {
+            return;
+        }
+        self.state.cursor_hidden_at.set(None);
+        unsafe {
+            SetCursor(self.state.current_cursor.get());
         }
     }
 

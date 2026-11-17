@@ -11,14 +11,16 @@ pub enum TextAutospace {
     /// Preserve the native advances without inter-script spacing.
     #[default]
     None,
-    /// Add one eighth of a CJK advance between Han and narrow Latin/digit units.
-    IdeographAlphaNumeric,
+    /// Add one eighth of a CJK advance at Han/Western text and symbol boundaries.
+    IdeographWestern,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
     Ideograph,
-    AlphaNumeric,
+    Western,
+    Prefix,
+    Suffix,
     Other,
 }
 
@@ -28,15 +30,43 @@ fn class(grapheme: &str) -> Class {
     };
     if base.script() == Script::Han && base.is_alphabetic() {
         Class::Ideograph
-    } else if base.width() == Some(1)
-        && (base.is_ascii_digit() || (base.script() == Script::Latin && base.is_alphabetic()))
-        // A keycap's leading digit belongs to an emoji, not a numeric unit.
-        && !grapheme.contains('\u{20e3}')
+    } else if grapheme.contains(['\u{20e3}', '\u{fe0f}']) {
+        // A keycap/emoji presentation is not a Western text unit.
+        Class::Other
+    } else if matches!(base, '@' | '(' | '[' | '{' | '“') {
+        Class::Prefix
+    } else if matches!(base, ')' | ']' | '}' | '”') || is_superscript_suffix(base) {
+        Class::Suffix
+    } else if (base.width() == Some(1)
+        && (base.is_ascii_digit() || (base.script() == Script::Latin && base.is_alphabetic())))
+        || is_western_symbol(base)
     {
-        Class::AlphaNumeric
+        Class::Western
     } else {
         Class::Other
     }
+}
+
+// Pangu.js ANS/CJK and bracket boundary subset, without text rewriting or
+// quote/operator cleanup: vinta/pangu.js@785d5c88, src/shared/index.ts.
+// Dingbats are excluded so standalone pictographs stay on the emoji path.
+fn is_western_symbol(base: char) -> bool {
+    matches!(
+        base,
+        '$' | '%' | '^' | '&' | '*' | '-' | '+' | '\\' | '=' | '<' | '>'
+            | '\u{00a1}'..='\u{00ff}'
+            | '\u{0370}'..='\u{03ff}'
+            | '\u{2100}'..='\u{214f}'
+            | '\u{2150}'..='\u{218f}'
+    )
+}
+
+fn is_superscript_suffix(base: char) -> bool {
+    matches!(
+        base,
+        '®' | '²' | '³' | '¹' | '\u{2070}' | '\u{2071}' | '\u{2074}'
+            ..='\u{207c}' | '\u{207e}' | '\u{207f}' | '℠' | '™'
+    )
 }
 
 /// The original byte boundary and the adjacent Han unit used to measure CJK advance.
@@ -46,8 +76,8 @@ pub(super) fn boundaries(text: &str) -> impl Iterator<Item = (usize, usize)> + '
         .filter_map(move |(byte, grapheme)| {
             let current = class(grapheme);
             let boundary = match (previous.1, current) {
-                (Class::Ideograph, Class::AlphaNumeric) => Some((byte, previous.0)),
-                (Class::AlphaNumeric, Class::Ideograph) => Some((byte, byte)),
+                (Class::Ideograph, Class::Western | Class::Prefix) => Some((byte, previous.0)),
+                (Class::Western | Class::Suffix, Class::Ideograph) => Some((byte, byte)),
                 _ => None,
             };
             previous = (byte, current);
@@ -77,8 +107,8 @@ pub(super) fn enabled_boundaries<'a>(
         } else {
             Some(left)
         };
-        left.text_autospace == TextAutospace::IdeographAlphaNumeric
-            && right.is_some_and(|run| run.text_autospace == TextAutospace::IdeographAlphaNumeric)
+        left.text_autospace == TextAutospace::IdeographWestern
+            && right.is_some_and(|run| run.text_autospace == TextAutospace::IdeographWestern)
     })
 }
 
@@ -126,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn autospace_does_not_expand_existing_spaces_punctuation_or_emoji() {
+    fn autospace_does_not_expand_existing_spaces_fullwidth_punctuation_or_emoji() {
         for text in [
             "中文",
             "Rust2026",
@@ -138,9 +168,50 @@ mod tests {
             "甲1️⃣乙",
             "甲1\u{20e3}乙",
             "甲1️⃣\u{301}乙",
+            "甲❤️乙",
+            "甲❌乙",
+            "甲©️乙",
             "甲Ａ１２乙",
             "甲\nA",
             "甲\u{fffc}乙",
+        ] {
+            assert_eq!(boundaries(text).count(), 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn autospace_pangu_symbol_boundaries_keep_western_units_attached() {
+        for (text, prefixes) in [
+            ("增长15%后", vec!["增长", "增长15%"]),
+            ("温度25℃正常", vec!["温度", "温度25℃"]),
+            ("角度90°左右", vec!["角度", "角度90°"]),
+            ("价格$100起", vec!["价格", "价格$100"]),
+            ("使用C++开发", vec!["使用", "使用C++"]),
+            ("甲(乙)丙", vec!["甲", "甲(乙)"]),
+            ("甲[乙]丙", vec!["甲", "甲[乙]"]),
+            ("甲“乙”丙", vec!["甲", "甲“乙”"]),
+            ("甲@用户", vec!["甲"]),
+            ("甲²乙", vec!["甲²"]),
+            ("甲αβ乙", vec!["甲", "甲αβ"]),
+        ] {
+            assert_eq!(
+                boundaries(text).map(|entry| entry.0).collect::<Vec<_>>(),
+                prefixes
+                    .iter()
+                    .map(|prefix| prefix.len())
+                    .collect::<Vec<_>>(),
+                "{text}"
+            );
+        }
+        for text in [
+            "15%",
+            "25℃",
+            "C++",
+            "https://example.com/a?b=1",
+            "#标签",
+            "甲 % 乙",
+            "(中文)",
+            "甲％乙",
         ] {
             assert_eq!(boundaries(text).count(), 0, "{text}");
         }
@@ -153,7 +224,7 @@ mod tests {
             FontRun {
                 len: 3,
                 font_id: crate::FontId(0),
-                text_autospace: TextAutospace::IdeographAlphaNumeric,
+                text_autospace: TextAutospace::IdeographWestern,
             },
             FontRun {
                 len: 4,
@@ -163,11 +234,11 @@ mod tests {
             FontRun {
                 len: 3,
                 font_id: crate::FontId(0),
-                text_autospace: TextAutospace::IdeographAlphaNumeric,
+                text_autospace: TextAutospace::IdeographWestern,
             },
         ];
         assert_eq!(enabled_boundaries(text, &runs).count(), 0);
-        runs[1].text_autospace = TextAutospace::IdeographAlphaNumeric;
+        runs[1].text_autospace = TextAutospace::IdeographWestern;
         assert_eq!(
             enabled_boundaries(text, &runs)
                 .map(|entry| entry.0)

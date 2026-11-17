@@ -76,8 +76,9 @@ pub(crate) struct WindowsPlatformState {
     jump_list: RefCell<JumpList>,
     // NOTE: standard cursor handles don't need to close.
     pub(crate) current_cursor: Cell<Option<HCURSOR>>,
-    /// Shared with each window so `WM_SETCURSOR` can read it directly.
-    pub(crate) cursor_visible: Arc<AtomicBool>,
+    /// Hidden at this physical screen position until the pointer actually moves.
+    /// Shared on the UI thread with every window and `WM_SETCURSOR`.
+    pub(crate) cursor_hidden_at: Rc<Cell<Option<(i32, i32)>>>,
     /// Shared with each window to coordinate draws across windows on the UI
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
@@ -107,7 +108,7 @@ impl WindowsPlatformState {
             callbacks,
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
-            cursor_visible: Arc::new(AtomicBool::new(true)),
+            cursor_hidden_at: Rc::new(Cell::new(None)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
             menus: RefCell::new(Vec::new()),
@@ -290,7 +291,7 @@ impl WindowsPlatform {
             icon: self.icon,
             executor: self.foreground_executor.clone(),
             current_cursor: self.inner.state.current_cursor.get(),
-            cursor_visible: self.inner.state.cursor_visible.clone(),
+            cursor_hidden_at: self.inner.state.cursor_hidden_at.clone(),
             drop_target_helper: self.drop_target_helper.clone().unwrap(),
             validation_number: self.inner.validation_number,
             main_receiver: self.inner.main_receiver.clone(),
@@ -866,14 +867,17 @@ impl Platform for WindowsPlatform {
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
-        if !self
-            .inner
-            .state
-            .cursor_visible
-            .swap(false, Ordering::Relaxed)
-        {
+        if self.inner.state.cursor_hidden_at.get().is_some() {
             return;
         }
+        let mut position = POINT::default();
+        if unsafe { GetCursorPos(&mut position) }.log_err().is_none() {
+            return;
+        }
+        self.inner
+            .state
+            .cursor_hidden_at
+            .set(Some((position.x, position.y)));
 
         for handle in self.raw_window_handles.read().iter() {
             let Some(window) = window_from_hwnd(handle.as_raw()) else {
@@ -887,7 +891,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.inner.state.cursor_visible.load(Ordering::Relaxed)
+        self.inner.state.cursor_hidden_at.get().is_none()
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
@@ -1270,7 +1274,7 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) icon: HICON,
     pub(crate) executor: ForegroundExecutor,
     pub(crate) current_cursor: Option<HCURSOR>,
-    pub(crate) cursor_visible: Arc<AtomicBool>,
+    pub(crate) cursor_hidden_at: Rc<Cell<Option<(i32, i32)>>>,
     pub(crate) drop_target_helper: IDropTargetHelper,
     pub(crate) validation_number: usize,
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,

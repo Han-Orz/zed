@@ -1105,6 +1105,16 @@ impl DirectWriteState {
         };
 
         let device_context = &gpu_state.device_context;
+        // The shared context may still carry a window/opacity-target clip. Glyph
+        // layers use texture-local coordinates, not that target's screen region.
+        unsafe {
+            device_context.RSSetScissorRects(Some(&[RECT {
+                left: 0,
+                top: 0,
+                right: bitmap_size.width.0,
+                bottom: bitmap_size.height.0,
+            }]));
+        }
         unsafe { device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) };
         unsafe { device_context.VSSetShader(&gpu_state.vertex_shader, None) };
         unsafe { device_context.PSSetShader(&gpu_state.pixel_shader, None) };
@@ -1962,8 +1972,10 @@ mod tests {
         DevicePixels, Font, PlatformTextSystem, RenderGlyphParams, Rgba, bounds, point, px, size,
     };
     use std::ffi::c_void;
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
+        D3D11_BIND_RENDER_TARGET, D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_RASTERIZER_DESC,
+        D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
         D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
@@ -2080,6 +2092,11 @@ mod tests {
             .iter()
             .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
             .collect::<Result<_>>()?;
+        assert!(
+            first
+                .iter()
+                .all(|(_, bitmap)| bitmap.chunks_exact(4).any(|pixel| pixel[3] != 0))
+        );
 
         // Churn the texture heap with further rasterization passes. If the color
         // compositing leaks leftover texture data (the render target is not cleared),
@@ -2104,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn color_emoji_composites_over_cleared_texture() -> Result<()> {
+    fn color_emoji_composites_over_cleared_texture_with_window_scissor() -> Result<()> {
         let devices = DirectXDevices::new()?;
         let gpu_state = GPUState::new(&devices)?;
 
@@ -2177,6 +2194,27 @@ mod tests {
             &layer_alpha,
         )?;
 
+        // A prior window/opacity pass can leave a screen-space clip on the shared context.
+        let mut rasterizer = None;
+        unsafe {
+            gpu_state.device.CreateRasterizerState(
+                &D3D11_RASTERIZER_DESC {
+                    FillMode: D3D11_FILL_SOLID,
+                    CullMode: D3D11_CULL_NONE,
+                    ScissorEnable: true.into(),
+                    ..Default::default()
+                },
+                Some(&mut rasterizer),
+            )?;
+            gpu_state.device_context.RSSetState(rasterizer.as_ref());
+            gpu_state.device_context.RSSetScissorRects(Some(&[RECT {
+                left: 100,
+                top: 100,
+                right: 200,
+                bottom: 200,
+            }]));
+        }
+
         let rasterized = DirectWriteState::composite_color_layers(
             &gpu_state,
             std::slice::from_ref(&layer),
@@ -2185,6 +2223,11 @@ mod tests {
             &Some(render_target_view),
         )?;
 
+        assert_eq!(
+            &rasterized[..4],
+            &[255, 255, 255, 255],
+            "the inherited window scissor clipped the color glyph layer"
+        );
         let corner = (SIZE as usize - 1 + (SIZE as usize - 1) * SIZE as usize) * 4;
         assert_eq!(
             &rasterized[corner..corner + 4],

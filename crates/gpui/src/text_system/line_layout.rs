@@ -1100,14 +1100,14 @@ mod tests {
         let mut cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
         cx.update(|cx| {
             let system = crate::WindowTextSystem::new(cx.text_system().clone());
-            let text: SharedString = "甲Rust2026乙".into();
+            let text: SharedString = "甲Rust2026%乙".into();
             let mut run = crate::TextRun {
                 len: text.len(),
                 font: crate::font(".ZedSans"),
                 ..Default::default()
             };
             let plain = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
-            run.text_autospace = TextAutospace::IdeographAlphaNumeric;
+            run.text_autospace = TextAutospace::IdeographWestern;
             let spaced = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
             let again = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
             assert!(Arc::ptr_eq(&spaced.layout, &again.layout));
@@ -1126,7 +1126,7 @@ mod tests {
             };
             assert_eq!(indices(&spaced), indices(&plain));
             for (byte, _) in text.char_indices() {
-                let count = usize::from(byte >= 3) + usize::from(byte >= "甲Rust2026".len());
+                let count = usize::from(byte >= 3) + usize::from(byte >= "甲Rust2026%".len());
                 assert!(
                     (spaced.x_for_index(byte) - plain.x_for_index(byte) - gap * count).abs()
                         < px(0.001)
@@ -1143,7 +1143,7 @@ mod tests {
         let mut cx = crate::TestAppContext::build(crate::TestDispatcher::new(0), None);
         cx.update(|cx| {
             let system = crate::WindowTextSystem::new(cx.text_system().clone());
-            let text: SharedString = "甲A乙".into();
+            let text: SharedString = "甲%乙".into();
             let mut run = crate::TextRun {
                 len: text.len(),
                 font: crate::font(".ZedSans"),
@@ -1152,7 +1152,7 @@ mod tests {
             let plain = system.shape_line(text.clone(), px(24.), &[run.clone()], None);
             let font = cx.text_system().resolve_font(&run.font);
             let gap = cx.text_system().layout_width(font, px(24.), '水') / 8.;
-            run.text_autospace = TextAutospace::IdeographAlphaNumeric;
+            run.text_autospace = TextAutospace::IdeographWestern;
             let width = plain.x_for_index(4) + gap;
             let wrapped = system
                 .shape_text(text.clone(), px(24.), &[run], Some(width), None)

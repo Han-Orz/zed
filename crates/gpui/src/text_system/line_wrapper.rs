@@ -579,10 +579,10 @@ mod tests {
     #[test]
     fn autospace_wrapper_fits_without_retaining_edge_spacing() {
         let mut wrapper = build_wrapper();
-        let raw_width = wrapper.width_for_char('甲') + wrapper.width_for_char('A');
+        let raw_width = wrapper.width_for_char('甲') + wrapper.width_for_char('%');
         let gap = wrapper.width_for_char('水') / 8.;
-        wrapper.text_autospace = TextAutospace::IdeographAlphaNumeric;
-        let text = "甲A乙";
+        wrapper.text_autospace = TextAutospace::IdeographWestern;
+        let text = "甲%乙";
         let wraps: Vec<_> = wrapper
             .wrap_line(&[LineFragment::text(text)], raw_width + gap)
             .collect();
